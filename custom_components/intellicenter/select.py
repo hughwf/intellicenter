@@ -10,7 +10,7 @@ import logging
 from typing import Any
 
 from homeassistant.components.select import SelectEntity
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from pyintellicenter import (
@@ -106,13 +106,10 @@ class PumpModeSelect(PoolEntity, SelectEntity):
             _LOGGER.warning("Invalid pump mode option: %s", option)
             return
 
-        await self._controller.set_attribute(
-            self._pool_object.objnam, SELECT_ATTR, option
-        )
+        self.request_changes({SELECT_ATTR: option})
 
-    @callback
-    def _is_updated(self, updates: dict[str, dict[str, Any]]) -> bool:
-        """Check if the entity should be updated based on the changes."""
+    def isUpdated(self, updates: dict[str, dict[str, Any]]) -> bool:
+        """Return true if the entity is updated by the updates from IntelliCenter."""
         if self._pool_object.objnam not in updates:
             return False
         return SELECT_ATTR in updates[self._pool_object.objnam]

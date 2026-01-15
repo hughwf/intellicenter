@@ -262,11 +262,13 @@ async def async_setup_entry(
             circuit = coordinator.model[circuit_objnam] if circuit_objnam else None
             circuit_name = circuit.sname if circuit else circuit_objnam
 
-            # Get limits from parent pump, with defaults
+            # Get limits from parent pump
+            # Initialize RPM with defaults (most pumps support RPM)
+            # Initialize GPM to 0 - only set if parent pump actually has MAXF_ATTR
             rpm_min = PUMP_RPM_MIN_DEFAULT
             rpm_max = PUMP_RPM_MAX_DEFAULT
             gpm_min = PUMP_GPM_MIN_DEFAULT
-            gpm_max = PUMP_GPM_MAX_DEFAULT
+            gpm_max = 0  # Will be set from parent pump's MAXF_ATTR if supported
 
             if parent_pump:
                 if MIN_ATTR in parent_pump.attribute_keys and parent_pump[MIN_ATTR]:
@@ -296,10 +298,12 @@ async def async_setup_entry(
 
             # Determine pump capabilities from parent pump limits
             # VSF pumps have non-zero MAXF (flow) and MAX (RPM), supporting both modes
-            # SPEED-only pumps have MAX > 0 but MAXF = 0
+            # SPEED-only pumps (IntelliFlo VS) have MAX > 0 but MAXF = 0
             # FLOW-only pumps have MAXF > 0 but MAX = 0
             supports_rpm = rpm_max > 0
-            supports_gpm = gpm_max > PUMP_GPM_MIN_DEFAULT  # MAXF was set from parent
+            supports_gpm = (
+                gpm_max > 0
+            )  # Only True if MAXF_ATTR was set from parent pump
 
             # Create RPM setpoint entity if pump supports RPM control
             # Check both attribute presence AND parent pump capability
