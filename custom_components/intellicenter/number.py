@@ -294,9 +294,16 @@ async def async_setup_entry(
                     except (ValueError, TypeError):
                         pass
 
-            # Create RPM setpoint entity if SPEED attribute exists on PMPCIRC
-            # The presence of the attribute indicates the pump circuit supports RPM control
-            if SPEED_ATTR in pool_obj.attribute_keys:
+            # Determine pump capabilities from parent pump limits
+            # VSF pumps have non-zero MAXF (flow) and MAX (RPM), supporting both modes
+            # SPEED-only pumps have MAX > 0 but MAXF = 0
+            # FLOW-only pumps have MAXF > 0 but MAX = 0
+            supports_rpm = rpm_max > 0
+            supports_gpm = gpm_max > PUMP_GPM_MIN_DEFAULT  # MAXF was set from parent
+
+            # Create RPM setpoint entity if pump supports RPM control
+            # Check both attribute presence AND parent pump capability
+            if SPEED_ATTR in pool_obj.attribute_keys or supports_rpm:
                 numbers.append(
                     PoolNumber(
                         coordinator,
@@ -314,9 +321,9 @@ async def async_setup_entry(
                     )
                 )
 
-            # Create GPM setpoint entity if GPM attribute exists on PMPCIRC
-            # The presence of the attribute indicates the pump circuit supports GPM control
-            if GPM_ATTR in pool_obj.attribute_keys:
+            # Create GPM setpoint entity if pump supports GPM control
+            # Check both attribute presence AND parent pump capability (MAXF > 0)
+            if GPM_ATTR in pool_obj.attribute_keys or supports_gpm:
                 numbers.append(
                     PoolNumber(
                         coordinator,
