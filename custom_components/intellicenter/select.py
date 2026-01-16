@@ -82,10 +82,14 @@ async def async_setup_entry(
             circuit = coordinator.model[circuit_objnam] if circuit_objnam else None
             circuit_name = circuit.sname if circuit else circuit_objnam
 
+            # Get pump name from parent pump (PMPCIRC objects don't have meaningful sname)
+            pump_name = parent_pump.sname if parent_pump else "Pump"
+
             selects.append(
                 PumpModeSelect(
                     coordinator,
                     pool_obj,
+                    pump_name=pump_name,
                     circuit_name=circuit_name,
                 )
             )
@@ -103,10 +107,12 @@ class PumpModeSelect(PoolEntity, SelectEntity):
         self,
         coordinator: IntelliCenterCoordinator,
         pool_object: PoolObject,
+        pump_name: str,
         circuit_name: str,
     ) -> None:
         """Initialize the pump mode select entity."""
         super().__init__(coordinator, pool_object)
+        self._pump_name = pump_name
         self._circuit_name = circuit_name
         self._attr_options = PUMP_MODES
 
@@ -118,7 +124,7 @@ class PumpModeSelect(PoolEntity, SelectEntity):
     @property
     def name(self) -> str:
         """Return the name of the entity."""
-        return f"{self._pool_object.sname} Mode ({self._circuit_name})"
+        return f"{self._pump_name} Mode ({self._circuit_name})"
 
     @property
     def current_option(self) -> str | None:
