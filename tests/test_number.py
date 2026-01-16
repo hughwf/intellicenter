@@ -13,13 +13,14 @@ from pyintellicenter import (
     PRIM_ATTR,
     PUMP_TYPE,
     SEC_ATTR,
+    SELECT_ATTR,
     SPEED_ATTR,
     PoolModel,
     PoolObject,
 )
 import pytest
 
-from custom_components.intellicenter.number import PoolNumber
+from custom_components.intellicenter.number import PoolNumber, PumpSpeedNumber
 
 pytestmark = pytest.mark.asyncio
 
@@ -479,12 +480,12 @@ def pool_object_pmpcirc() -> PoolObject:
     )
 
 
-async def test_number_setup_creates_pmpcirc_entities(
+async def test_number_setup_creates_vsf_pump_entity(
     hass: HomeAssistant,
     pool_model_with_pmpcirc: PoolModel,
     mock_coordinator: MagicMock,
 ) -> None:
-    """Test number platform creates entities for pump circuit settings."""
+    """Test number platform creates single PumpSpeedNumber for VSF pump."""
     mock_coordinator.model = pool_model_with_pmpcirc
 
     mock_entry = MagicMock()
@@ -500,9 +501,10 @@ async def test_number_setup_creates_pmpcirc_entities(
 
     await async_setup_entry(hass, mock_entry, capture_entities)
 
-    # Should create 2 number entities (RPM and GPM for VSF pump)
-    pmpcirc_entities = [e for e in entities_added if "RPM" in e.name or "GPM" in e.name]
-    assert len(pmpcirc_entities) == 2
+    # Should create 1 PumpSpeedNumber entity for VSF pump (unified speed control)
+    pump_entities = [e for e in entities_added if isinstance(e, PumpSpeedNumber)]
+    assert len(pump_entities) == 1
+    assert "Speed" in pump_entities[0].name
 
 
 async def test_number_pmpcirc_rpm_properties(
@@ -652,3 +654,447 @@ async def test_number_pmpcirc_state_updates(
 
     # Verify value changed
     assert number.native_value == 100
+
+
+# --- PumpSpeedNumber Tests (VSF Pump Dynamic Entity) ---
+
+
+@pytest.fixture
+def pool_object_pmpcirc_vsf() -> PoolObject:
+    """Return a PoolObject representing a VSF pump circuit setting."""
+    return PoolObject(
+        "PMPCIRC01",
+        {
+            "OBJTYP": PMPCIRC_TYPE,
+            "SNAME": "Pool Pump Circuit 1",
+            "PARENT": "PUMP1",
+            "CIRCUIT": "CIRC01",
+            "SELECT": "GPM",
+            "SPEED": "80",
+        },
+    )
+
+
+@pytest.fixture
+def pool_object_pmpcirc_rpm_mode() -> PoolObject:
+    """Return a PoolObject representing a pump circuit in RPM mode."""
+    return PoolObject(
+        "PMPCIRC01",
+        {
+            "OBJTYP": PMPCIRC_TYPE,
+            "SNAME": "Pool Pump Circuit 1",
+            "PARENT": "PUMP1",
+            "CIRCUIT": "CIRC01",
+            "SELECT": "RPM",
+            "SPEED": "2400",
+        },
+    )
+
+
+async def test_pump_speed_number_gpm_mode(
+    hass: HomeAssistant,
+    pool_object_pmpcirc_vsf: PoolObject,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Test PumpSpeedNumber in GPM mode returns correct unit and limits."""
+    from custom_components.intellicenter.const import CONST_GPM
+
+    number = PumpSpeedNumber(
+        mock_coordinator,
+        pool_object_pmpcirc_vsf,
+        pump_name="Pool Pump",
+        circuit_name="Pool Circuit",
+        rpm_min=450,
+        rpm_max=3450,
+        gpm_min=15,
+        gpm_max=140,
+    )
+
+    # In GPM mode
+    assert number._current_mode == "GPM"
+    assert number.native_unit_of_measurement == CONST_GPM
+    assert number.native_min_value == 15.0
+    assert number.native_max_value == 140.0
+    assert number.native_step == 5.0
+    assert number.native_value == 80
+
+
+async def test_pump_speed_number_rpm_mode(
+    hass: HomeAssistant,
+    pool_object_pmpcirc_rpm_mode: PoolObject,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Test PumpSpeedNumber in RPM mode returns correct unit and limits."""
+    from custom_components.intellicenter.const import CONST_RPM
+
+    number = PumpSpeedNumber(
+        mock_coordinator,
+        pool_object_pmpcirc_rpm_mode,
+        pump_name="Pool Pump",
+        circuit_name="Pool Circuit",
+        rpm_min=450,
+        rpm_max=3450,
+        gpm_min=15,
+        gpm_max=140,
+    )
+
+    # In RPM mode
+    assert number._current_mode == "RPM"
+    assert number.native_unit_of_measurement == CONST_RPM
+    assert number.native_min_value == 450.0
+    assert number.native_max_value == 3450.0
+    assert number.native_step == 50.0
+    assert number.native_value == 2400
+
+
+async def test_pump_speed_number_mode_switching(
+    hass: HomeAssistant,
+    pool_object_pmpcirc_rpm_mode: PoolObject,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Test PumpSpeedNumber updates when mode switches from RPM to GPM."""
+    from custom_components.intellicenter.const import CONST_GPM, CONST_RPM
+
+    number = PumpSpeedNumber(
+        mock_coordinator,
+        pool_object_pmpcirc_rpm_mode,
+        pump_name="Pool Pump",
+        circuit_name="Pool Circuit",
+        rpm_min=450,
+        rpm_max=3450,
+        gpm_min=15,
+        gpm_max=140,
+    )
+
+    # Initially in RPM mode
+    assert number.native_unit_of_measurement == CONST_RPM
+    assert number.native_max_value == 3450.0
+
+    # Simulate mode switch to GPM
+    pool_object_pmpcirc_rpm_mode.update({SELECT_ATTR: "GPM", SPEED_ATTR: "80"})
+
+    # Now in GPM mode
+    assert number._current_mode == "GPM"
+    assert number.native_unit_of_measurement == CONST_GPM
+    assert number.native_max_value == 140.0
+    assert number.native_value == 80
+
+
+async def test_pump_speed_number_is_updated_on_speed_change(
+    hass: HomeAssistant,
+    pool_object_pmpcirc_vsf: PoolObject,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Test PumpSpeedNumber isUpdated returns True for SPEED changes."""
+    number = PumpSpeedNumber(
+        mock_coordinator,
+        pool_object_pmpcirc_vsf,
+        pump_name="Pool Pump",
+        circuit_name="Pool Circuit",
+        rpm_min=450,
+        rpm_max=3450,
+        gpm_min=15,
+        gpm_max=140,
+    )
+
+    # Should update on SPEED change
+    assert number.isUpdated({"PMPCIRC01": {SPEED_ATTR: "100"}}) is True
+
+
+async def test_pump_speed_number_is_updated_on_select_change(
+    hass: HomeAssistant,
+    pool_object_pmpcirc_vsf: PoolObject,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Test PumpSpeedNumber isUpdated returns True for SELECT changes."""
+    number = PumpSpeedNumber(
+        mock_coordinator,
+        pool_object_pmpcirc_vsf,
+        pump_name="Pool Pump",
+        circuit_name="Pool Circuit",
+        rpm_min=450,
+        rpm_max=3450,
+        gpm_min=15,
+        gpm_max=140,
+    )
+
+    # Should update on SELECT change (mode switch)
+    assert number.isUpdated({"PMPCIRC01": {SELECT_ATTR: "RPM"}}) is True
+
+
+async def test_pump_speed_number_not_updated_on_other_object(
+    hass: HomeAssistant,
+    pool_object_pmpcirc_vsf: PoolObject,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Test PumpSpeedNumber isUpdated returns False for other objects."""
+    number = PumpSpeedNumber(
+        mock_coordinator,
+        pool_object_pmpcirc_vsf,
+        pump_name="Pool Pump",
+        circuit_name="Pool Circuit",
+        rpm_min=450,
+        rpm_max=3450,
+        gpm_min=15,
+        gpm_max=140,
+    )
+
+    # Should not update on other object
+    assert number.isUpdated({"OTHER": {SPEED_ATTR: "100"}}) is False
+
+
+async def test_pump_speed_number_set_value(
+    hass: HomeAssistant,
+    pool_object_pmpcirc_vsf: PoolObject,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Test setting PumpSpeedNumber value writes to SPEED attribute."""
+    number = PumpSpeedNumber(
+        mock_coordinator,
+        pool_object_pmpcirc_vsf,
+        pump_name="Pool Pump",
+        circuit_name="Pool Circuit",
+        rpm_min=450,
+        rpm_max=3450,
+        gpm_min=15,
+        gpm_max=140,
+    )
+    number.hass = hass
+
+    await number.async_set_native_value(100)
+
+    # Should use request_changes with SPEED attribute
+    mock_coordinator.controller.request_changes.assert_called_once()
+    call_args = mock_coordinator.controller.request_changes.call_args
+    assert call_args[0][0] == "PMPCIRC01"
+    assert call_args[0][1] == {SPEED_ATTR: "100"}
+
+
+async def test_pump_speed_number_unique_id(
+    hass: HomeAssistant,
+    pool_object_pmpcirc_vsf: PoolObject,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Test PumpSpeedNumber unique ID generation."""
+    number = PumpSpeedNumber(
+        mock_coordinator,
+        pool_object_pmpcirc_vsf,
+        pump_name="Pool Pump",
+        circuit_name="Pool Circuit",
+        rpm_min=450,
+        rpm_max=3450,
+        gpm_min=15,
+        gpm_max=140,
+    )
+
+    # Unique ID includes SPEED attribute key
+    assert number.unique_id == "test_entry_PMPCIRC01SPEED"
+
+
+async def test_pump_speed_number_name(
+    hass: HomeAssistant,
+    pool_object_pmpcirc_vsf: PoolObject,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Test PumpSpeedNumber name format."""
+    number = PumpSpeedNumber(
+        mock_coordinator,
+        pool_object_pmpcirc_vsf,
+        pump_name="Pool Pump",
+        circuit_name="Pool Circuit",
+        rpm_min=450,
+        rpm_max=3450,
+        gpm_min=15,
+        gpm_max=140,
+    )
+
+    # Name format: "{pump_name} Speed ({circuit_name})"
+    assert number.name == "Pool Pump Speed (Pool Circuit)"
+
+
+async def test_pump_speed_number_default_mode_when_none(
+    hass: HomeAssistant,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Test PumpSpeedNumber defaults to RPM mode when SELECT is None."""
+    from custom_components.intellicenter.const import CONST_RPM
+
+    obj = PoolObject(
+        "PMPCIRC01",
+        {
+            "OBJTYP": PMPCIRC_TYPE,
+            "SNAME": "Pool Pump Circuit 1",
+            "PARENT": "PUMP1",
+            "CIRCUIT": "CIRC01",
+            "SELECT": None,  # No mode set
+            "SPEED": "2400",
+        },
+    )
+
+    number = PumpSpeedNumber(
+        mock_coordinator,
+        obj,
+        pump_name="Pool Pump",
+        circuit_name="Pool Circuit",
+        rpm_min=450,
+        rpm_max=3450,
+        gpm_min=15,
+        gpm_max=140,
+    )
+
+    # Should default to RPM mode
+    assert number._current_mode == "RPM"
+    assert number.native_unit_of_measurement == CONST_RPM
+
+
+# --- VS-only and VF-only Pump Tests ---
+
+
+@pytest.fixture
+def pool_model_with_vs_pump() -> PoolModel:
+    """Return a PoolModel with a variable speed (VS) pump (RPM only)."""
+    model = PoolModel()
+    model.add_objects(
+        [
+            {
+                "objnam": "CIRC01",
+                "params": {
+                    "OBJTYP": CIRCUIT_TYPE,
+                    "SUBTYP": "GENERIC",
+                    "SNAME": "Pool Circuit",
+                },
+            },
+            {
+                "objnam": "PUMP1",
+                "params": {
+                    "OBJTYP": PUMP_TYPE,
+                    "SUBTYP": "VS",
+                    "SNAME": "VS Pump",
+                    "STATUS": "10",
+                    "MIN": "450",
+                    "MAX": "3450",
+                    "MINF": "0",  # VS pump doesn't support GPM
+                    "MAXF": "0",  # VS pump doesn't support GPM
+                },
+            },
+            {
+                "objnam": "PMPCIRC01",
+                "params": {
+                    "OBJTYP": PMPCIRC_TYPE,
+                    "SNAME": "VS Pump Circuit 1",
+                    "PARENT": "PUMP1",
+                    "CIRCUIT": "CIRC01",
+                    "SELECT": "RPM",
+                    "SPEED": "2400",
+                },
+            },
+        ]
+    )
+    return model
+
+
+@pytest.fixture
+def pool_model_with_vf_pump() -> PoolModel:
+    """Return a PoolModel with a variable flow (VF) pump (GPM only)."""
+    model = PoolModel()
+    model.add_objects(
+        [
+            {
+                "objnam": "CIRC01",
+                "params": {
+                    "OBJTYP": CIRCUIT_TYPE,
+                    "SUBTYP": "GENERIC",
+                    "SNAME": "Pool Circuit",
+                },
+            },
+            {
+                "objnam": "PUMP1",
+                "params": {
+                    "OBJTYP": PUMP_TYPE,
+                    "SUBTYP": "VF",
+                    "SNAME": "VF Pump",
+                    "STATUS": "10",
+                    "MIN": "0",  # VF pump doesn't support RPM
+                    "MAX": "0",  # VF pump doesn't support RPM
+                    "MINF": "15",
+                    "MAXF": "140",
+                },
+            },
+            {
+                "objnam": "PMPCIRC01",
+                "params": {
+                    "OBJTYP": PMPCIRC_TYPE,
+                    "SNAME": "VF Pump Circuit 1",
+                    "PARENT": "PUMP1",
+                    "CIRCUIT": "CIRC01",
+                    "SELECT": "GPM",
+                    "GPM": "80",
+                },
+            },
+        ]
+    )
+    return model
+
+
+async def test_number_setup_creates_vs_pump_rpm_entity(
+    hass: HomeAssistant,
+    pool_model_with_vs_pump: PoolModel,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Test number platform creates PoolNumber with RPM for VS pump."""
+    mock_coordinator.model = pool_model_with_vs_pump
+
+    mock_entry = MagicMock()
+    mock_entry.entry_id = "test_entry"
+    mock_entry.runtime_data = mock_coordinator
+
+    entities_added = []
+
+    def capture_entities(entities):
+        entities_added.extend(entities)
+
+    from custom_components.intellicenter.number import async_setup_entry
+
+    await async_setup_entry(hass, mock_entry, capture_entities)
+
+    # Should create 1 PoolNumber entity for VS pump (RPM only)
+    pump_entities = [
+        e
+        for e in entities_added
+        if hasattr(e, "_pool_object") and e._pool_object.objtype == PMPCIRC_TYPE
+    ]
+    assert len(pump_entities) == 1
+    assert isinstance(pump_entities[0], PoolNumber)
+    assert "RPM" in pump_entities[0].name
+
+
+async def test_number_setup_creates_vf_pump_gpm_entity(
+    hass: HomeAssistant,
+    pool_model_with_vf_pump: PoolModel,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Test number platform creates PoolNumber with GPM for VF pump."""
+    mock_coordinator.model = pool_model_with_vf_pump
+
+    mock_entry = MagicMock()
+    mock_entry.entry_id = "test_entry"
+    mock_entry.runtime_data = mock_coordinator
+
+    entities_added = []
+
+    def capture_entities(entities):
+        entities_added.extend(entities)
+
+    from custom_components.intellicenter.number import async_setup_entry
+
+    await async_setup_entry(hass, mock_entry, capture_entities)
+
+    # Should create 1 PoolNumber entity for VF pump (GPM only)
+    pump_entities = [
+        e
+        for e in entities_added
+        if hasattr(e, "_pool_object") and e._pool_object.objtype == PMPCIRC_TYPE
+    ]
+    assert len(pump_entities) == 1
+    assert isinstance(pump_entities[0], PoolNumber)
+    assert "GPM" in pump_entities[0].name

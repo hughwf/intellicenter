@@ -45,6 +45,7 @@ from pyintellicenter import (
     PMPCIRC_TYPE,
     PRIM_ATTR,
     SEC_ATTR,
+    SELECT_ATTR,
     SPEED_ATTR,
     PoolObject,
 )
@@ -105,7 +106,7 @@ async def async_setup_entry(
     """Load pool number entities based on a config entry."""
     coordinator = entry.runtime_data
 
-    numbers: list[PoolNumber] = []
+    numbers: list[PoolNumber | PumpSpeedNumber] = []
 
     pool_obj: PoolObject
     for pool_obj in coordinator.model:
@@ -305,9 +306,26 @@ async def async_setup_entry(
                 gpm_max > 0
             )  # Only True if MAXF_ATTR was set from parent pump
 
-            # Create RPM setpoint entity if pump supports RPM control
-            # Check both attribute presence AND parent pump capability
-            if SPEED_ATTR in pool_obj.attribute_keys or supports_rpm:
+            # Determine pump name for entity naming
+            pump_name = parent_pump.sname if parent_pump else "Pump"
+
+            if supports_rpm and supports_gpm:
+                # VSF pump: Create single dynamic PumpSpeedNumber entity
+                # that changes units/limits based on SELECT mode
+                numbers.append(
+                    PumpSpeedNumber(
+                        coordinator,
+                        pool_obj,
+                        pump_name=pump_name,
+                        circuit_name=circuit_name,
+                        rpm_min=rpm_min,
+                        rpm_max=rpm_max,
+                        gpm_min=gpm_min,
+                        gpm_max=gpm_max,
+                    )
+                )
+            elif supports_rpm:
+                # VS pump (RPM only): Create PoolNumber with SPEED attribute
                 numbers.append(
                     PoolNumber(
                         coordinator,
@@ -324,10 +342,8 @@ async def async_setup_entry(
                         integer_only=True,
                     )
                 )
-
-            # Create GPM setpoint entity if pump supports GPM control
-            # Check both attribute presence AND parent pump capability (MAXF > 0)
-            if GPM_ATTR in pool_obj.attribute_keys or supports_gpm:
+            elif supports_gpm:
+                # VF pump (GPM only): Create PoolNumber with GPM attribute
                 numbers.append(
                     PoolNumber(
                         coordinator,
@@ -438,3 +454,107 @@ class PoolNumber(PoolEntity, NumberEntity):
             _LOGGER.warning("Invalid setpoint value for %s: %s", objnam, err)
         except Exception:
             _LOGGER.exception("Failed to set value for %s", objnam)
+
+
+# -------------------------------------------------------------------------------------
+
+
+class PumpSpeedNumber(PoolEntity, NumberEntity):
+    """Dynamic pump speed setpoint that changes units/limits based on pump mode.
+
+    VSF (Variable Speed/Flow) pumps use a unified setpoint model where the SPEED
+    attribute holds either RPM or GPM value depending on the SELECT mode. This
+    entity dynamically adjusts its unit of measurement, min/max values, and step
+    size based on the current mode.
+
+    When SELECT="RPM": shows RPM, limits from parent pump's MIN/MAX
+    When SELECT="GPM": shows GPM, limits from parent pump's MINF/MAXF
+    """
+
+    _attr_icon = "mdi:speedometer"
+    _attr_mode = NumberMode.BOX
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(
+        self,
+        coordinator: IntelliCenterCoordinator,
+        pool_object: PoolObject,
+        pump_name: str,
+        circuit_name: str,
+        rpm_min: int,
+        rpm_max: int,
+        gpm_min: int,
+        gpm_max: int,
+    ) -> None:
+        """Initialize a pump speed number entity.
+
+        Args:
+            coordinator: The coordinator for this integration
+            pool_object: The PoolObject (PMPCIRC) this entity represents
+            pump_name: Name of the parent pump for entity naming
+            circuit_name: Name of the circuit for entity naming
+            rpm_min: Minimum RPM value (from parent pump MIN attribute)
+            rpm_max: Maximum RPM value (from parent pump MAX attribute)
+            gpm_min: Minimum GPM value (from parent pump MINF attribute)
+            gpm_max: Maximum GPM value (from parent pump MAXF attribute)
+        """
+        super().__init__(
+            coordinator,
+            pool_object,
+            attribute_key=SPEED_ATTR,
+            name=f"{pump_name} Speed ({circuit_name})",
+        )
+
+        self._rpm_min = rpm_min
+        self._rpm_max = rpm_max
+        self._gpm_min = gpm_min
+        self._gpm_max = gpm_max
+
+    @property
+    def _current_mode(self) -> str:
+        """Get current mode from SELECT attribute.
+
+        Returns:
+            "RPM" or "GPM" - defaults to "RPM" if not set
+        """
+        return str(self._pool_object[SELECT_ATTR] or "RPM")
+
+    @property
+    def native_unit_of_measurement(self) -> str:
+        """Return the unit of measurement based on current mode."""
+        return CONST_GPM if self._current_mode == "GPM" else CONST_RPM
+
+    @property
+    def native_min_value(self) -> float:
+        """Return the minimum value based on current mode."""
+        return float(self._gpm_min if self._current_mode == "GPM" else self._rpm_min)
+
+    @property
+    def native_max_value(self) -> float:
+        """Return the maximum value based on current mode."""
+        return float(self._gpm_max if self._current_mode == "GPM" else self._rpm_max)
+
+    @property
+    def native_step(self) -> float:
+        """Return the step size based on current mode."""
+        return float(PUMP_GPM_STEP if self._current_mode == "GPM" else PUMP_RPM_STEP)
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the current speed value from SPEED attribute."""
+        return self._safe_int_conversion(self._pool_object[SPEED_ATTR])
+
+    async def async_set_native_value(self, value: float) -> None:
+        """Set the speed value via SPEED attribute."""
+        self.request_changes({SPEED_ATTR: str(int(value))})
+
+    def isUpdated(self, updates: dict[str, dict[str, Any]]) -> bool:
+        """Return true if SPEED or SELECT changed.
+
+        We need to update on SELECT changes because the unit of measurement
+        and limits change when the mode switches.
+        """
+        if self._pool_object.objnam not in updates:
+            return False
+        changed = updates[self._pool_object.objnam]
+        return SPEED_ATTR in changed or SELECT_ATTR in changed
