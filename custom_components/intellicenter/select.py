@@ -15,6 +15,9 @@ from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from pyintellicenter import (
     CIRCUIT_ATTR,
+    MAX_ATTR,
+    MAXF_ATTR,
+    PARENT_ATTR,
     PMPCIRC_TYPE,
     SELECT_ATTR,
     PoolObject,
@@ -46,9 +49,34 @@ async def async_setup_entry(
 
     pool_obj: PoolObject
     for pool_obj in coordinator.model:
-        # Create pump mode selector for PMPCIRC objects that have SELECT_ATTR
-        # This indicates a VSF pump that supports both RPM and GPM modes
+        # Create pump mode selector only for PMPCIRC objects where the parent pump
+        # supports BOTH RPM (MAX_ATTR > 0) and GPM (MAXF_ATTR > 0) modes
         if pool_obj.objtype == PMPCIRC_TYPE and SELECT_ATTR in pool_obj.attribute_keys:
+            # Get the parent pump to check capabilities
+            parent_objnam = pool_obj[PARENT_ATTR]
+            parent_pump = coordinator.model[parent_objnam] if parent_objnam else None
+
+            # Check if parent pump supports both RPM and GPM
+            supports_rpm = False
+            supports_gpm = False
+            if parent_pump:
+                # Check MAX_ATTR for RPM support
+                if MAX_ATTR in parent_pump.attribute_keys and parent_pump[MAX_ATTR]:
+                    try:
+                        supports_rpm = int(parent_pump[MAX_ATTR]) > 0
+                    except (ValueError, TypeError):
+                        pass
+                # Check MAXF_ATTR for GPM support
+                if MAXF_ATTR in parent_pump.attribute_keys and parent_pump[MAXF_ATTR]:
+                    try:
+                        supports_gpm = int(parent_pump[MAXF_ATTR]) > 0
+                    except (ValueError, TypeError):
+                        pass
+
+            # Only create selector if pump supports both modes
+            if not (supports_rpm and supports_gpm):
+                continue
+
             # Get the associated circuit for naming
             circuit_objnam = pool_obj[CIRCUIT_ATTR]
             circuit = coordinator.model[circuit_objnam] if circuit_objnam else None
