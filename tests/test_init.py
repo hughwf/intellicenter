@@ -1,11 +1,14 @@
 """Test the Pentair IntelliCenter integration initialization."""
 
+import asyncio
+import errno
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
+from pyintellicenter import ICCommandError, ICConnectionError, ICTimeoutError
 import pytest
 
 from custom_components.intellicenter import (
@@ -62,22 +65,126 @@ async def test_async_setup_entry_success(
             mock_forward.assert_called_once_with(entry, PLATFORMS)
 
 
-async def test_async_setup_entry_connection_failed(hass: HomeAssistant) -> None:
-    """Test setup fails when connection is refused."""
+@pytest.mark.parametrize(
+    ("exc", "expected_exc"),
+    [
+        # Transient connection failures -> ConfigEntryNotReady so HA retries with
+        # backoff (issue #41). pyintellicenter surfaces transport problems as
+        # ICConnectionError/ICTimeoutError, but ICConnectionHandler.start() can also
+        # re-raise a raw OSError/TimeoutError from the first attempt, so builtin
+        # connection/timeout errors and network-errno OSErrors are transient too.
+        (ICConnectionError("connection refused"), ConfigEntryNotReady),
+        (ICTimeoutError("request timed out"), ConfigEntryNotReady),
+        (OSError(errno.EHOSTUNREACH, "no route to host"), ConfigEntryNotReady),
+        (ConnectionResetError("connection reset by peer"), ConfigEntryNotReady),
+        (TimeoutError(), ConfigEntryNotReady),
+        # Permanent faults -> propagate as setup_error instead of retrying forever:
+        # a rejected command (protocol/firmware fault), a non-network OSError, or an
+        # unrelated programming error.
+        (ICCommandError("404"), ICCommandError),
+        (PermissionError(errno.EACCES, "permission denied"), PermissionError),
+        (OSError(errno.ENOSPC, "no space left on device"), OSError),
+        (ValueError("boom"), ValueError),
+        # Cancellation must clean up too: CancelledError is a BaseException that
+        # bypasses `except Exception`, so cleanup must live in the finally.
+        (asyncio.CancelledError(), asyncio.CancelledError),
+    ],
+    ids=[
+        "transient-ICConnectionError",
+        "transient-ICTimeoutError",
+        "transient-OSError-EHOSTUNREACH",
+        "transient-ConnectionResetError",
+        "transient-TimeoutError",
+        "permanent-ICCommandError",
+        "permanent-PermissionError",
+        "permanent-OSError-ENOSPC",
+        "permanent-ValueError",
+        "cancelled-CancelledError",
+    ],
+)
+async def test_async_setup_entry_start_failure(
+    hass: HomeAssistant, exc: BaseException, expected_exc: type[BaseException]
+) -> None:
+    """A failing or cancelled async_start() is classified, and the partial coordinator
+    is always torn down (cleanup lives in a finally) with no entry state left.
+
+    Transient connection failures raise ConfigEntryNotReady so HA retries with backoff
+    (issue #41); everything else propagates unchanged — a rejected command or
+    non-network OSError as a permanent setup_error, a programming error as-is, and
+    CancelledError preserved. Either way async_stop() must run, platforms must not be
+    forwarded, and runtime_data must be untouched.
+    """
     entry = MagicMock(spec=ConfigEntry)
     entry.entry_id = "test_entry_id"
     entry.data = {CONF_HOST: "192.168.1.100"}
     entry.options = {}  # No custom options, will use defaults
+    entry.runtime_data = "UNSET"  # sentinel: must remain unchanged on failure
 
-    # Mock coordinator to raise ConnectionRefusedError on start
-    with patch.object(
-        IntelliCenterCoordinator,
-        "async_start",
-        new_callable=AsyncMock,
-        side_effect=ConnectionRefusedError(),
+    with (
+        patch.object(
+            IntelliCenterCoordinator,
+            "async_start",
+            new_callable=AsyncMock,
+            side_effect=exc,
+        ),
+        patch.object(
+            IntelliCenterCoordinator,
+            "async_stop",
+            new_callable=AsyncMock,
+        ) as mock_stop,
+        patch.object(
+            hass.config_entries,
+            "async_forward_entry_setups",
+            new_callable=AsyncMock,
+        ) as mock_forward,
+        pytest.raises(expected_exc),
     ):
-        with pytest.raises(ConfigEntryNotReady):
-            await async_setup_entry(hass, entry)
+        await async_setup_entry(hass, entry)
+
+    # Cleanup is decoupled from classification: the partially started coordinator must
+    # be torn down on BOTH the transient and permanent paths so its
+    # EVENT_HOMEASSISTANT_STOP listener and pyintellicenter reconnect task don't leak.
+    mock_stop.assert_awaited_once()
+    mock_forward.assert_not_called()
+    assert entry.runtime_data == "UNSET"
+
+
+async def test_async_setup_entry_post_connect_failure_cleans_up(
+    hass: HomeAssistant,
+) -> None:
+    """A failure after the connection succeeds still stops the coordinator.
+
+    async_start() succeeds (so the reconnect task + HA-stop listener are running), then
+    platform forwarding raises. HA does not unload an entry whose setup raised, so
+    async_setup_entry itself must tear the coordinator down or the reconnect loop leaks.
+    """
+    entry = MagicMock(spec=ConfigEntry)
+    entry.entry_id = "test_entry_id"
+    entry.data = {CONF_HOST: "192.168.1.100"}
+    entry.options = {}
+    entry.async_on_unload = MagicMock()
+    entry.add_update_listener = MagicMock()
+
+    with (
+        patch.object(IntelliCenterCoordinator, "async_start", new_callable=AsyncMock),
+        patch.object(
+            IntelliCenterCoordinator,
+            "async_stop",
+            new_callable=AsyncMock,
+        ) as mock_stop,
+        patch.object(
+            hass.config_entries,
+            "async_forward_entry_setups",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("platform setup failed"),
+        ),
+        pytest.raises(RuntimeError),
+    ):
+        await async_setup_entry(hass, entry)
+
+    # Connection succeeded then forwarding failed -> the running coordinator must be
+    # stopped so its reconnect task + listener don't leak across HA's setup retries.
+    mock_stop.assert_awaited_once()
 
 
 async def test_async_unload_entry(hass: HomeAssistant) -> None:

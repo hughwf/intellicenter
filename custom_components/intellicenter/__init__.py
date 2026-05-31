@@ -8,6 +8,8 @@ It supports Zeroconf discovery and local push updates for real-time responsivene
 from __future__ import annotations
 
 from collections.abc import Iterable
+import contextlib
+import errno
 import logging
 import re
 from typing import TYPE_CHECKING, Any
@@ -23,7 +25,9 @@ from homeassistant.helpers.typing import ConfigType
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from pyintellicenter import (
     STATUS_ATTR,
+    ICConnectionError,
     ICModelController,
+    ICTimeoutError,
     PoolObject,
 )
 
@@ -68,6 +72,48 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
 
+# OSError errnos that indicate a transient network condition (the panel / bridge is
+# briefly unreachable or still booting) rather than a permanent local fault.
+# ConnectionError and TimeoutError subclasses are always transient and handled
+# separately in _is_transient_connection_error().
+_TRANSIENT_OS_ERRNOS = frozenset(
+    code
+    for code in (
+        getattr(errno, _name, None)
+        for _name in (
+            "EHOSTUNREACH",
+            "ENETUNREACH",
+            "ETIMEDOUT",
+            "EHOSTDOWN",
+            "ENETDOWN",
+            "ENETRESET",
+        )
+    )
+    if code is not None
+)
+
+
+def _is_transient_connection_error(err: Exception) -> bool:
+    """Return True if ``err`` is a transient connection failure worth retrying.
+
+    pyintellicenter raises ICConnectionError / ICTimeoutError for transport problems
+    (refused, reset, timeout, EHOSTUNREACH — issue #41). ICConnectionHandler.start()
+    can also re-raise a raw OSError / TimeoutError surfaced via the request future on
+    the first connection attempt, so builtin connection/timeout errors and
+    network-errno OSErrors are treated as transient too.
+
+    Everything else is treated as permanent so setup fails visibly instead of retrying
+    forever: ICCommandError (the panel actively rejected a command — a protocol or
+    firmware incompatibility, which per HA guidance is a permanent fault rather than an
+    outage) and non-network OSErrors such as PermissionError or ENOSPC.
+    """
+    if isinstance(err, (ICConnectionError, ICTimeoutError)):
+        return True
+    if isinstance(err, (ConnectionError, TimeoutError)):
+        return True
+    return isinstance(err, OSError) and err.errno in _TRANSIENT_OS_ERRNOS
+
+
 async def async_setup_entry(
     hass: HomeAssistant, entry: IntelliCenterConfigEntry
 ) -> bool:
@@ -91,23 +137,45 @@ async def async_setup_entry(
         transport=transport,
     )
 
+    # Bring the connection up, then wire up platforms + the options listener. The whole
+    # sequence shares one cleanup contract via `setup_complete`: on ANY non-success exit
+    # the finally stops the coordinator, because async_start() starts a reconnect task +
+    # EVENT_HOMEASSISTANT_STOP listener and HA does not unload an entry whose setup
+    # raised — so this is the only place those can be torn down. The `connected` flag
+    # scopes transient/permanent classification to the connection attempt only; a
+    # post-connect failure (e.g. a platform setup error) propagates unchanged.
+    connected = False
+    setup_complete = False
     try:
-        # Start the connection
         await coordinator.async_start()
-
-        # Store the coordinator in the entry's runtime_data
+        connected = True
         entry.runtime_data = coordinator
-
-        # Set up platforms
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
-        # Register update listener for options changes
         entry.async_on_unload(entry.add_update_listener(async_reload_entry))
+        setup_complete = True
+    except Exception as err:
+        if not connected and _is_transient_connection_error(err):
+            # Transient connection failure → HA's built-in exponential-backoff retry
+            # instead of a permanent setup_error needing a manual reload (issue #41).
+            # The message (host + cause) is shown to the user while HA retries.
+            raise ConfigEntryNotReady(
+                f"Could not connect to IntelliCenter at {entry.data[CONF_HOST]}: {err}"
+            ) from err
+        # Permanent / unexpected fault (rejected command, non-network OSError, a
+        # post-connect platform error, a programming error, ...): fail loudly as
+        # setup_error rather than retry forever or mask it as transient.
+        raise
+    finally:
+        # Runs on failure OR cancellation (CancelledError is a BaseException that
+        # bypasses `except Exception`). async_stop() is null-safe on a partial start;
+        # suppress so cleanup never masks the original exception. A coordinator left in
+        # runtime_data by a post-connect failure is now stopped (inert) and is replaced
+        # on the next setup attempt.
+        if not setup_complete:
+            with contextlib.suppress(Exception):
+                await coordinator.async_stop()
 
-        return True
-
-    except ConnectionRefusedError as err:
-        raise ConfigEntryNotReady from err
+    return True
 
 
 async def async_unload_entry(
