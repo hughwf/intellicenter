@@ -1,8 +1,26 @@
 """Pentair Intellicenter water heaters.
 
 This module provides water heater entities for pool and spa heating control.
-Supports multiple heater types (gas, solar, heat pump) and remembers the
-last used heater for convenient turn-on operations.
+A single :class:`PoolWaterHeater` models three kinds of body uniformly:
+
+* **pure-standard** — only standard heaters (gas/solar/heat pump) are wired to
+  the body. They are selected by assigning ``HEATER=<objnam>``; the panel derives
+  the body ``MODE``.
+* **pure-HCOMBO** — only a multi-mode combo heater (subtype HCOMBO, e.g. Pentair
+  UltraTemp ETi Hybrid) is wired. IntelliCenter ignores ``HEATER`` assignments for
+  HCOMBO heaters; instead the body ``MODE`` attribute must be written to a
+  :class:`HeaterType` value. HCOMBO heaters expose all four sub-modes (Gas Only,
+  Heat Pump Only, Hybrid, Dual) as distinct operation modes.
+* **mixed** — the body's heater list contains BOTH an HCOMBO heater AND one or
+  more standard heaters. Operations from both planes appear in the dropdown.
+
+Every operation label resolves to a single atomic body write via
+:meth:`PoolWaterHeater._operation_to_changes`, which sets the chosen control
+plane and clears the opposite plane where safe. ``current_operation`` gives an
+assigned standard heater precedence over the HCOMBO ``MODE`` so the reported
+state stays correct even if one plane is momentarily stale after a switch. The
+last non-off operation is remembered (and restored across restarts) so turn-on
+returns the body to its previous mode.
 """
 
 from __future__ import annotations
@@ -27,14 +45,30 @@ from pyintellicenter import (
     LISTORD_ATTR,
     LOTMP_ATTR,
     LSTTMP_ATTR,
+    MODE_ATTR,
     NULL_OBJNAM,
     STATUS_ATTR,
     STATUS_OFF,
+    HeaterType,
     PoolObject,
 )
 
 from . import IntelliCenterConfigEntry, PoolEntity
 from .coordinator import IntelliCenterCoordinator
+
+# IntelliCenter subtype for multi-mode combo heaters (e.g. UltraTemp ETi Hybrid)
+_HCOMBO_SUBTYPE = "HCOMBO"
+
+# Display labels for each HCOMBO mode shown in the operation dropdown
+_HCOMBO_MODE_LABELS: dict[HeaterType, str] = {
+    HeaterType.HYBRID_GAS: "Gas Only",
+    HeaterType.HYBRID_ULTRA_TEMP: "Heat Pump Only",
+    HeaterType.HYBRID_HYBRID: "Hybrid",
+    HeaterType.HYBRID_DUAL: "Dual",
+}
+_HCOMBO_LABEL_TO_MODE: dict[str, HeaterType] = {
+    label: mode for mode, label in _HCOMBO_MODE_LABELS.items()
+}
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -83,7 +117,7 @@ async def async_setup_entry(
 class PoolWaterHeater(PoolEntity, WaterHeaterEntity, RestoreEntity):
     """Representation of a Pentair water heater."""
 
-    LAST_HEATER_ATTR = "LAST_HEATER"
+    LAST_OPERATION_ATTR = "LAST_OPERATION"
     _attr_icon = "mdi:thermometer"
 
     def __init__(
@@ -99,23 +133,98 @@ class PoolWaterHeater(PoolEntity, WaterHeaterEntity, RestoreEntity):
             extra_state_attributes=[HEATER_ATTR, HTMODE_ATTR],
         )
         self._heater_list = heater_list
-        self._last_heater: str | None = self._pool_object[HEATER_ATTR]
+        self._is_multimode: bool = self._detect_multimode()
+        # Remember the last non-off operation so turn-on can restore it. None
+        # means the body is currently off (nothing to restore yet).
+        self._last_operation: str | None = self.current_operation
+        if self._last_operation == STATE_OFF:
+            self._last_operation = None
+
+    def _detect_multimode(self) -> bool:
+        """Return True if any heater in this entity's list is a multi-mode (HCOMBO) heater."""
+        for heater_id in self._heater_list:
+            heater_obj = self.coordinator.model[heater_id]
+            if heater_obj is not None and heater_obj.subtype == _HCOMBO_SUBTYPE:
+                return True
+        return False
+
+    def _current_hcombo_mode(self) -> HeaterType | None:
+        """Return the active HCOMBO HeaterType, or None if off or not applicable."""
+        if not self._is_multimode:
+            return None
+        mode = self._pool_object[MODE_ATTR]
+        if mode:
+            try:
+                ht = HeaterType(int(mode))
+            except ValueError:
+                return None
+            if ht in _HCOMBO_MODE_LABELS:
+                return ht
+        return None
+
+    def _operation_to_changes(self, operation: str) -> dict[str, str] | None:
+        """Resolve an operation label to the atomic body changes that select it.
+
+        Returns None if the label is not a known operation for this body. HCOMBO
+        sub-mode labels are only honoured on multimode bodies, so a standard heater
+        whose name happens to match an HCOMBO label is never misrouted to the MODE
+        plane on a non-multimode body. (On a multimode body an HCOMBO sub-mode label
+        takes precedence over an identically-named standard heater — a pathological
+        config; operation_list de-dupes so it is never shown twice.)
+        """
+        if operation == STATE_OFF:
+            return {HEATER_ATTR: NULL_OBJNAM, MODE_ATTR: str(HeaterType.OFF.value)}
+        if self._is_multimode:
+            heater_type = _HCOMBO_LABEL_TO_MODE.get(operation)
+            if heater_type is not None:
+                # HCOMBO sub-mode: set the body MODE and clear any standard heater
+                # assignment so the standard-heater-precedence in current_operation
+                # reflects the HCOMBO mode. HEATER=NULL is safe (turn-off writes it too).
+                return {MODE_ATTR: str(heater_type.value), HEATER_ATTR: NULL_OBJNAM}
+        for heater in self._heater_list:
+            heater_obj = self.coordinator.model[heater]
+            if heater_obj is not None and operation == heater_obj.sname:
+                # Standard heater: assign it. We intentionally do NOT write MODE here
+                # (MODE=OFF would disable heating; the correct MODE depends on the
+                # heater's type and the panel derives it). current_operation prefers an
+                # assigned standard heater over a possibly-stale HCOMBO MODE.
+                return {HEATER_ATTR: heater}
+        return None
+
+    def _default_on_operation(self) -> str:
+        """Return a safe default operation label for turn-on with no last operation."""
+        if self._is_multimode:
+            # Economical default: heat pump only (NOT Dual, which runs gas + heat
+            # pump together).
+            return _HCOMBO_MODE_LABELS[HeaterType.HYBRID_ULTRA_TEMP]
+        for heater in self._heater_list:
+            heater_obj = self.coordinator.model[heater]
+            if (
+                heater_obj is not None
+                and heater_obj.sname is not None
+                and heater_obj.subtype != _HCOMBO_SUBTYPE
+            ):
+                return str(heater_obj.sname)
+        # Fall back to the first heater's sname if no standard heater is found.
+        first = self.coordinator.model[self._heater_list[0]]
+        return str(first.sname) if first is not None else STATE_OFF
 
     @property
     def _is_heater_active(self) -> bool:
-        """Return True if the body is on and a heater is assigned."""
-        return bool(
-            self._pool_object[STATUS_ATTR] != STATUS_OFF
-            and self._pool_object[HEATER_ATTR] != NULL_OBJNAM
-        )
+        """Return True if a heat mode/heater is selected and the body is on."""
+        if self._pool_object[STATUS_ATTR] == STATUS_OFF:
+            return False
+        # str() pins the comparison operand to str so the result is a concrete
+        # bool (HA's STATE_OFF is loosely typed and would otherwise widen to Any).
+        return self.current_operation != str(STATE_OFF)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return the state attributes of the entity."""
         state_attributes = super().extra_state_attributes
 
-        if self._last_heater != NULL_OBJNAM:
-            state_attributes[self.LAST_HEATER_ATTR] = self._last_heater
+        if self._last_operation is not None:
+            state_attributes[self.LAST_OPERATION_ATTR] = self._last_operation
 
         if self._is_heater_active:
             htmode = self._pool_object[HTMODE_ATTR]
@@ -187,60 +296,86 @@ class PoolWaterHeater(PoolEntity, WaterHeaterEntity, RestoreEntity):
         a body even when it's off (e.g., setting the Spa heater while in Pool
         mode). The real-time heating activity is exposed via the heating_status
         extra state attribute.
+
+        For multi-mode (HCOMBO) heaters, operation is controlled via MODE_ATTR
+        on the body rather than HEATER_ATTR assignment.
         """
+        # An assigned standard (non-HCOMBO) heater takes precedence. This also makes
+        # the state correct when a stale HCOMBO MODE remains after switching to a
+        # standard heater on a mixed body.
         heater = self._pool_object[HEATER_ATTR]
         if heater in self._heater_list:
             heater_obj = self.coordinator.model[heater]
-            if heater_obj is not None and heater_obj.sname is not None:
+            if (
+                heater_obj is not None
+                and heater_obj.sname is not None
+                and heater_obj.subtype != _HCOMBO_SUBTYPE
+            ):
                 return str(heater_obj.sname)
+        if self._is_multimode:
+            mode = self._current_hcombo_mode()
+            if mode is not None:
+                return _HCOMBO_MODE_LABELS[mode]
         return str(STATE_OFF)
 
     @property
     def operation_list(self) -> list[str]:
         """Return the list of available operation modes."""
         operations: list[str] = [str(STATE_OFF)]
+        if self._is_multimode:
+            operations.extend(_HCOMBO_MODE_LABELS.values())
+        # Always include standard (non-HCOMBO) heaters — handles pure standard and
+        # mixed bodies. Skip a standard heater whose name collides with an HCOMBO
+        # label already listed (so the dropdown never shows a duplicate entry).
         for heater in self._heater_list:
             heater_obj = self.coordinator.model[heater]
-            if heater_obj is not None and heater_obj.sname is not None:
+            if (
+                heater_obj is not None
+                and heater_obj.sname is not None
+                and heater_obj.subtype != _HCOMBO_SUBTYPE
+                and heater_obj.sname not in operations
+            ):
                 operations.append(heater_obj.sname)
         return operations
 
     async def async_set_operation_mode(self, operation_mode: str) -> None:
         """Set new target operation mode."""
-        if operation_mode == STATE_OFF:
-            self._turn_off()
-        else:
-            for heater in self._heater_list:
-                heater_obj = self.coordinator.model[heater]
-                if heater_obj is not None and operation_mode == heater_obj.sname:
-                    self.request_changes({HEATER_ATTR: heater})
-                    break
+        changes = self._operation_to_changes(operation_mode)
+        if changes is None:
+            _LOGGER.warning("Unknown operation mode: %s", operation_mode)
+            return
+        await self._controller.request_changes(self._pool_object.objnam, changes)
 
     async def async_turn_on(self) -> None:
-        """Turn the entity on."""
-        heater = (
-            self._last_heater
-            if self._last_heater and self._last_heater != NULL_OBJNAM
-            else self._heater_list[0]
-        )
-        self.request_changes({HEATER_ATTR: heater})
+        """Turn the entity on, restoring the last operation or a safe default."""
+        operation = self._last_operation
+        if operation is None or self._operation_to_changes(operation) is None:
+            operation = self._default_on_operation()
+        changes = self._operation_to_changes(operation)
+        if changes is not None:
+            await self._controller.request_changes(self._pool_object.objnam, changes)
 
     async def async_turn_off(self) -> None:
-        """Turn the entity off."""
-        self._turn_off()
-
-    def _turn_off(self) -> None:
-        """Turn off the water heater."""
-        self.request_changes({HEATER_ATTR: NULL_OBJNAM})
+        """Turn the entity off, clearing both control planes atomically."""
+        await self._controller.request_changes(
+            self._pool_object.objnam,
+            {HEATER_ATTR: NULL_OBJNAM, MODE_ATTR: str(HeaterType.OFF.value)},
+        )
 
     def isUpdated(self, updates: dict[str, dict[str, Any]]) -> bool:
         """Return true if the entity is updated by the updates from IntelliCenter."""
         updated = self._check_attributes_updated(
-            updates, STATUS_ATTR, HEATER_ATTR, HTMODE_ATTR, LOTMP_ATTR, LSTTMP_ATTR
+            updates,
+            STATUS_ATTR,
+            HEATER_ATTR,
+            HTMODE_ATTR,
+            LOTMP_ATTR,
+            LSTTMP_ATTR,
+            MODE_ATTR,
         )
 
-        if updated and self._pool_object[HEATER_ATTR] != NULL_OBJNAM:
-            self._last_heater = self._pool_object[HEATER_ATTR]
+        if updated and self.current_operation != STATE_OFF:
+            self._last_operation = self.current_operation
 
         return updated
 
@@ -248,12 +383,17 @@ class PoolWaterHeater(PoolEntity, WaterHeaterEntity, RestoreEntity):
         """Entity is added to Home Assistant."""
         await super().async_added_to_hass()
 
-        if self._last_heater == NULL_OBJNAM:
-            # Our current state is OFF so
-            # let's see if we find a previous value stored in our state
-            last_state = await self.async_get_last_state()
+        if self._last_operation is not None:
+            return
 
-            if last_state:
-                value = last_state.attributes.get(self.LAST_HEATER_ATTR)
-                if value and value != NULL_OBJNAM:
-                    self._last_heater = value
+        last_state = await self.async_get_last_state()
+        if last_state:
+            saved = last_state.attributes.get(self.LAST_OPERATION_ATTR)
+            # Only restore a label that is still a valid (non-off) operation for
+            # this body's current configuration.
+            if (
+                saved is not None
+                and saved != STATE_OFF
+                and saved in self.operation_list
+            ):
+                self._last_operation = saved
