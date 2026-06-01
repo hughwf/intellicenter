@@ -47,6 +47,7 @@ from pyintellicenter import (
     RPM_ATTR,
     SALT_ATTR,
     SENSE_TYPE,
+    SERVICE_ATTR,
     SOURCE_ATTR,
     SYSTEM_TYPE,
     VER_ATTR,
@@ -297,6 +298,11 @@ def _build_entities(
                         state_class=None,  # Non-numeric value
                     )
                 )
+            # System operating mode (Auto / Service / Time out). Shown as a
+            # primary sensor (not diagnostic) to mirror the IntelliCenter app's
+            # dashboard mode banner.
+            if SERVICE_ATTR in obj.attribute_keys:
+                sensors.append(SystemModeSensor(coordinator, obj))
     return sensors
 
 
@@ -384,3 +390,65 @@ class PoolSensor(PoolEntity, SensorEntity):
         if self._attr_device_class == SensorDeviceClass.TEMPERATURE:
             return self.pentairTemperatureSettings()
         return self._attr_native_unit_of_measurement
+
+
+# The documented IntelliCenter system operating modes. Only "auto" is
+# hardware-confirmed (the SYSTEM object reports SERVICE='AUTO' in normal
+# automatic operation); the exact "service"/"timeout" protocol strings are
+# inferred from Pentair documentation and have not been observed on hardware.
+SYSTEM_MODE_OPTIONS = ["auto", "service", "timeout"]
+
+
+class SystemModeSensor(PoolSensor):
+    """System operating-mode sensor (Auto / Service / Time out).
+
+    IntelliCenter reports the operating mode on the SYSTEM object via the
+    SERVICE attribute. It is exposed as an enum sensor; the per-state labels
+    are localized via ``translation_key`` (``entity.sensor.system_mode.state``).
+    The entity name itself is set explicitly -- like the Firmware Version sensor
+    -- because ``PoolEntity.name`` overrides Home Assistant's translation-based
+    naming, so a ``translation_key`` name would never be consulted.
+
+    Only the ``AUTO`` value is hardware-confirmed; ``service`` and ``timeout``
+    are the documented modes (Pentair manuals) but their exact protocol strings
+    are inferred. Raw values are normalized case- and space-insensitively, and
+    any value outside the known options is reported as unknown so the enum
+    sensor never raises on an unexpected string.
+    """
+
+    _attr_translation_key = "system_mode"
+
+    def __init__(
+        self,
+        coordinator: IntelliCenterCoordinator,
+        pool_object: PoolObject,
+    ) -> None:
+        """Initialize the system mode sensor."""
+        super().__init__(
+            coordinator,
+            pool_object,
+            device_class=SensorDeviceClass.ENUM,
+            attribute_key=SERVICE_ATTR,
+            name="System Mode",
+            icon="mdi:cog-sync",
+            # ENUM sensors must not declare a state_class.
+            state_class=None,
+        )
+        self._attr_options = SYSTEM_MODE_OPTIONS
+
+    @property
+    def native_value(self) -> str | None:
+        """Return the normalized system mode, or None if unrecognized.
+
+        The raw SERVICE value is normalized case- and space-insensitively so
+        variants like "AUTO", "Service", or "TIME OUT" map onto the documented
+        ``auto``/``service``/``timeout`` options. A value outside that set is
+        reported as ``None`` (unknown) rather than returned verbatim, because
+        Home Assistant raises ``ValueError`` when an enum sensor's state is not
+        one of its declared ``options``.
+        """
+        raw_value = self._pool_object[self._attribute_key]
+        if raw_value is None:
+            return None
+        normalized = str(raw_value).strip().lower().replace(" ", "")
+        return normalized if normalized in SYSTEM_MODE_OPTIONS else None
