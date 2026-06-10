@@ -26,8 +26,10 @@ from homeassistant.components.climate.const import (
     HVACMode,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from pyintellicenter import (
+    COOL_ATTR,
     HEATER_ATTR,
     HITMP_ATTR,
     HTMODE_ATTR,
@@ -44,6 +46,7 @@ from . import (
     PoolEntity,
     async_setup_pool_entities,
     bodies_affected_by,
+    body_temperature_limits,
     heaters_for_body,
 )
 from .coordinator import IntelliCenterCoordinator
@@ -156,14 +159,12 @@ class PoolClimate(PoolEntity, ClimateEntity):
     @property
     def min_temp(self) -> float:
         """Return the minimum temperature."""
-        system_info = self.coordinator.system_info
-        return 5.0 if system_info and system_info.uses_metric else 40.0
+        return body_temperature_limits(self.coordinator)[0]
 
     @property
     def max_temp(self) -> float:
         """Return the maximum temperature."""
-        system_info = self.coordinator.system_info
-        return 40.0 if system_info and system_info.uses_metric else 104.0
+        return body_temperature_limits(self.coordinator)[1]
 
     @property
     def current_temperature(self) -> float | None:
@@ -226,13 +227,16 @@ class PoolClimate(PoolEntity, ClimateEntity):
         if htmode == "0":
             return HVACAction.IDLE
 
+        # Cooling must be checked BEFORE heating: is_body_heating() is just
+        # HTMODE != "0", which is also true while an UltraTemp actively COOLS
+        # (the heat source is running). is_body_cooling() (heater COOL == ON)
+        # is the more specific signal, so it wins.
+        if self._controller.is_body_cooling(self._pool_object.objnam):
+            return HVACAction.COOLING
+
         # Check if actively heating
         if self._controller.is_body_heating(self._pool_object.objnam):
             return HVACAction.HEATING
-
-        # Check if actively cooling (UltraTemp heat pump)
-        if self._controller.is_body_cooling(self._pool_object.objnam):
-            return HVACAction.COOLING
 
         # Heater is enabled but not actively heating or cooling
         return HVACAction.IDLE
@@ -260,27 +264,35 @@ class PoolClimate(PoolEntity, ClimateEntity):
                 break
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
-        """Set new target temperatures."""
+        """Set new target temperatures.
+
+        Library and connection failures surface as HomeAssistantError so the
+        service call reports a clean error instead of silently logging.
+        """
         low_temp = kwargs.get(ATTR_TARGET_TEMP_LOW)
         high_temp = kwargs.get(ATTR_TARGET_TEMP_HIGH)
 
         if low_temp is not None:
-            try:
-                temp_value = int(low_temp)
-                await self._controller.set_heating_setpoint(
-                    self._pool_object.objnam, temp_value
+            await self._async_execute_command(
+                self._controller.set_heating_setpoint(
+                    self._pool_object.objnam, self._coerce_setpoint(low_temp)
                 )
-            except (ValueError, TypeError):
-                _LOGGER.exception("Invalid heating setpoint value '%s'", low_temp)
+            )
 
         if high_temp is not None:
-            try:
-                temp_value = int(high_temp)
-                await self._controller.set_cooling_setpoint(
-                    self._pool_object.objnam, temp_value
+            await self._async_execute_command(
+                self._controller.set_cooling_setpoint(
+                    self._pool_object.objnam, self._coerce_setpoint(high_temp)
                 )
-            except (ValueError, TypeError):
-                _LOGGER.exception("Invalid cooling setpoint value '%s'", high_temp)
+            )
+
+    @staticmethod
+    def _coerce_setpoint(value: Any) -> int:
+        """Coerce a service-supplied setpoint to int or raise a clean error."""
+        try:
+            return int(value)
+        except (ValueError, TypeError) as err:
+            raise HomeAssistantError(f"Invalid temperature value '{value}'") from err
 
     async def async_turn_on(self) -> None:
         """Turn on the climate entity."""
@@ -294,7 +306,7 @@ class PoolClimate(PoolEntity, ClimateEntity):
     def isUpdated(self, updates: dict[str, dict[str, Any]]) -> bool:
         """Return true if the entity is updated."""
         my_updates = updates.get(self._pool_object.objnam, {})
-        return bool(
+        if bool(
             my_updates
             and {
                 STATUS_ATTR,
@@ -305,4 +317,8 @@ class PoolClimate(PoolEntity, ClimateEntity):
                 LSTTMP_ATTR,
             }
             & my_updates.keys()
-        )
+        ):
+            return True
+        # hvac_action also depends on the heater objects' COOL attribute, which
+        # arrives as an update for the HEATER objnam, not the body.
+        return any(COOL_ATTR in updates.get(heater, {}) for heater in self._heater_list)

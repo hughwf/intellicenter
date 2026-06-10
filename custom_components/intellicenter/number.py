@@ -27,6 +27,7 @@ from homeassistant.const import (
     EntityCategory,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from pyintellicenter import (
     ALK_ATTR,
@@ -53,7 +54,13 @@ from pyintellicenter import (
     PoolObject,
 )
 
-from . import IntelliCenterConfigEntry, PoolEntity, async_setup_pool_entities
+from . import (
+    IntelliCenterConfigEntry,
+    PoolEntity,
+    async_setup_pool_entities,
+    body_temperature_limits,
+    safe_int,
+)
 from .const import CONST_GPM, CONST_RPM
 from .coordinator import IntelliCenterCoordinator
 
@@ -84,9 +91,8 @@ CYACID_MIN = 0
 CYACID_MAX = 200
 CYACID_STEP = 1
 
-# Temperature setpoint ranges (Fahrenheit)
-TEMP_SETPOINT_MIN = 40
-TEMP_SETPOINT_MAX = 104
+# Temperature setpoint step; min/max come from body_temperature_limits() so the
+# range follows the panel's METRIC/ENGLISH unit (40-104 F / 5-40 C).
 TEMP_SETPOINT_STEP = 1
 
 # Pump speed/flow ranges (defaults, actual limits come from pump MIN/MAX attributes)
@@ -238,8 +244,11 @@ def _build_entities(
                 PoolNumber(
                     coordinator,
                     pool_obj,
-                    min_value=TEMP_SETPOINT_MIN,
-                    max_value=TEMP_SETPOINT_MAX,
+                    # min/max/unit are derived live from the panel's METRIC/
+                    # ENGLISH mode via PoolNumber's temperature-aware
+                    # properties; hardcoded Fahrenheit bounds made this entity
+                    # unusable on METRIC systems (every valid Celsius setpoint
+                    # was out of the 40-104 range).
                     step=TEMP_SETPOINT_STEP,
                     attribute_key=HITMP_ATTR,
                     name="+ Max Temperature",
@@ -282,30 +291,20 @@ def _build_entities(
             gpm_max = 0  # Will be set from parent pump's MAXF_ATTR if supported
 
             if parent_pump:
-                if MIN_ATTR in parent_pump.attribute_keys and parent_pump[MIN_ATTR]:
-                    try:
-                        rpm_min = int(parent_pump[MIN_ATTR])
-                    except (ValueError, TypeError):
-                        pass
-                if MAX_ATTR in parent_pump.attribute_keys and parent_pump[MAX_ATTR]:
-                    try:
-                        rpm_max = int(parent_pump[MAX_ATTR])
-                    except (ValueError, TypeError):
-                        pass
-                if MINF_ATTR in parent_pump.attribute_keys and parent_pump[MINF_ATTR]:
-                    try:
-                        val = int(parent_pump[MINF_ATTR])
-                        if val > 0:
-                            gpm_min = val
-                    except (ValueError, TypeError):
-                        pass
-                if MAXF_ATTR in parent_pump.attribute_keys and parent_pump[MAXF_ATTR]:
-                    try:
-                        val = int(parent_pump[MAXF_ATTR])
-                        if val > 0:
-                            gpm_max = val
-                    except (ValueError, TypeError):
-                        pass
+                # RPM limits take the pump's value even when 0 (MAX=0 marks a
+                # flow-only pump); GPM limits only accept positive values.
+                rpm_min_val = safe_int(parent_pump[MIN_ATTR])
+                if rpm_min_val is not None:
+                    rpm_min = rpm_min_val
+                rpm_max_val = safe_int(parent_pump[MAX_ATTR])
+                if rpm_max_val is not None:
+                    rpm_max = rpm_max_val
+                gpm_min_val = safe_int(parent_pump[MINF_ATTR])
+                if gpm_min_val is not None and gpm_min_val > 0:
+                    gpm_min = gpm_min_val
+                gpm_max_val = safe_int(parent_pump[MAXF_ATTR])
+                if gpm_max_val is not None and gpm_max_val > 0:
+                    gpm_max = gpm_max_val
 
             # Determine pump capabilities from parent pump limits
             # VSF pumps have non-zero MAXF (flow) and MAX (RPM), supporting both modes
@@ -423,11 +422,40 @@ class PoolNumber(PoolEntity, NumberEntity):
         self._attr_native_max_value = max_value
         self._attr_native_step = step
         self._integer_only = integer_only
-        if device_class:
-            self._attr_device_class = device_class
+        # Assign unconditionally: newer HA cores declare _attr_device_class as
+        # an annotation without a class-level default, so a conditional
+        # assignment leaves the attribute MISSING and any read of it raises
+        # AttributeError (every no-device-class number failed to add on the
+        # dev container while the pinned test HA still had a class default).
+        self._attr_device_class = device_class
         self._attr_mode = mode
         if entity_category:
             self._attr_entity_category = entity_category
+
+    @property
+    def native_unit_of_measurement(self) -> str | None:
+        """Return the unit of measurement.
+
+        Temperature entities report the panel's native unit (METRIC/ENGLISH)
+        so Home Assistant converts the displayed value correctly.
+        """
+        if self.device_class == NumberDeviceClass.TEMPERATURE:
+            return self.pentairTemperatureSettings()
+        return self._attr_native_unit_of_measurement
+
+    @property
+    def native_min_value(self) -> float:
+        """Return the minimum value, panel-unit aware for temperatures."""
+        if self.device_class == NumberDeviceClass.TEMPERATURE:
+            return body_temperature_limits(self.coordinator)[0]
+        return self._attr_native_min_value
+
+    @property
+    def native_max_value(self) -> float:
+        """Return the maximum value, panel-unit aware for temperatures."""
+        if self.device_class == NumberDeviceClass.TEMPERATURE:
+            return body_temperature_limits(self.coordinator)[1]
+        return self._attr_native_max_value
 
     @property
     def native_value(self) -> float | int | None:
@@ -456,23 +484,30 @@ class PoolNumber(PoolEntity, NumberEntity):
             CYACID_ATTR: ("set_cyanuric_acid", int),
         }
 
-        try:
-            if self._attribute_key in dispatch:
-                method_name, converter = dispatch[self._attribute_key]
-                method = getattr(controller, method_name)
-                await method(objnam, converter(value))
-            elif self._attribute_key == SEC_ATTR:
-                # Secondary chlorinator needs current primary preserved
-                current = controller.get_chlorinator_output(objnam)
-                primary = current.get("primary") or 0
-                await controller.set_chlorinator_output(objnam, primary, int(value))
-            else:
-                # Fallback for other number entities (e.g., HITMP)
-                self.request_changes({self._attribute_key: str(int(value))})
-        except ValueError as err:
-            _LOGGER.warning("Invalid setpoint value for %s: %s", objnam, err)
-        except Exception:
-            _LOGGER.exception("Failed to set value for %s", objnam)
+        # Failures raise HomeAssistantError (via _async_execute_command) so the
+        # service call reports the problem; previously they were swallowed and
+        # the call 'succeeded' while the UI value silently snapped back.
+        if self._attribute_key in dispatch:
+            method_name, converter = dispatch[self._attribute_key]
+            method = getattr(controller, method_name)
+            await self._async_execute_command(method(objnam, converter(value)))
+        elif self._attribute_key == SEC_ATTR:
+            # Secondary chlorinator needs the current primary preserved. If the
+            # primary output is unknown, abort rather than silently writing
+            # PRIM=0 (which would zero the primary chlorinator as a side effect).
+            current = controller.get_chlorinator_output(objnam)
+            primary = current.get("primary")
+            if primary is None:
+                raise HomeAssistantError(
+                    f"Cannot set secondary chlorinator output for {objnam}: "
+                    "primary output is not known yet"
+                )
+            await self._async_execute_command(
+                controller.set_chlorinator_output(objnam, primary, int(value))
+            )
+        else:
+            # Fallback for other number entities (e.g., HITMP)
+            self.request_changes({self._attribute_key: str(int(value))})
 
 
 # -------------------------------------------------------------------------------------

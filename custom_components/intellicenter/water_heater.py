@@ -35,6 +35,7 @@ from homeassistant.components.water_heater import (
 )
 from homeassistant.const import ATTR_TEMPERATURE, STATE_OFF
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 from pyintellicenter import (
@@ -55,6 +56,7 @@ from . import (
     PoolEntity,
     async_setup_pool_entities,
     bodies_affected_by,
+    body_temperature_limits,
     heaters_for_body,
 )
 from .coordinator import IntelliCenterCoordinator
@@ -274,14 +276,12 @@ class PoolWaterHeater(PoolEntity, WaterHeaterEntity, RestoreEntity):
     @property
     def min_temp(self) -> float:
         """Return the minimum value."""
-        system_info = self.coordinator.system_info
-        return 5.0 if system_info and system_info.uses_metric else 4.0
+        return body_temperature_limits(self.coordinator)[0]
 
     @property
     def max_temp(self) -> float:
         """Return the maximum temperature."""
-        system_info = self.coordinator.system_info
-        return 40.0 if system_info and system_info.uses_metric else 104.0
+        return body_temperature_limits(self.coordinator)[1]
 
     @property
     def current_temperature(self) -> float | None:
@@ -299,19 +299,23 @@ class PoolWaterHeater(PoolEntity, WaterHeaterEntity, RestoreEntity):
         if target_temperature is not None:
             try:
                 temp_value = int(target_temperature)
-                # Use pyintellicenter convenience method
-                await self._controller.set_setpoint(
-                    self._pool_object.objnam, temp_value
-                )
-            except (ValueError, TypeError):
-                _LOGGER.exception("Invalid temperature value '%s'", target_temperature)
+            except (ValueError, TypeError) as err:
+                raise HomeAssistantError(
+                    f"Invalid temperature value '{target_temperature}'"
+                ) from err
+            # Library and connection failures surface as HomeAssistantError so
+            # the service call reports a clean error instead of silently
+            # logging while the UI snaps back.
+            await self._async_execute_command(
+                self._controller.set_setpoint(self._pool_object.objnam, temp_value)
+            )
 
     @property
     def current_operation(self) -> str:
         """Return current operation.
 
         This reflects the configured heater mode, independent of whether the
-        body is currently running (STATUS). A user can pre-select a heater for
+        body is currently running (STATUS). A user can preselect a heater for
         a body even when it's off (e.g., setting the Spa heater while in Pool
         mode). The real-time heating activity is exposed via the heating_status
         extra state attribute.
@@ -363,7 +367,9 @@ class PoolWaterHeater(PoolEntity, WaterHeaterEntity, RestoreEntity):
         if changes is None:
             _LOGGER.warning("Unknown operation mode: %s", operation_mode)
             return
-        await self._controller.request_changes(self._pool_object.objnam, changes)
+        await self._async_execute_command(
+            self._controller.request_changes(self._pool_object.objnam, changes)
+        )
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the entity on, restoring the last operation or a safe default."""
@@ -372,13 +378,17 @@ class PoolWaterHeater(PoolEntity, WaterHeaterEntity, RestoreEntity):
             operation = self._default_on_operation()
         changes = self._operation_to_changes(operation)
         if changes is not None:
-            await self._controller.request_changes(self._pool_object.objnam, changes)
+            await self._async_execute_command(
+                self._controller.request_changes(self._pool_object.objnam, changes)
+            )
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the entity off, clearing both control planes atomically."""
-        await self._controller.request_changes(
-            self._pool_object.objnam,
-            {HEATER_ATTR: NULL_OBJNAM, MODE_ATTR: str(HeaterType.OFF.value)},
+        await self._async_execute_command(
+            self._controller.request_changes(
+                self._pool_object.objnam,
+                {HEATER_ATTR: NULL_OBJNAM, MODE_ATTR: str(HeaterType.OFF.value)},
+            )
         )
 
     def isUpdated(self, updates: dict[str, dict[str, Any]]) -> bool:

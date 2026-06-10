@@ -20,6 +20,7 @@ from pyintellicenter import (
 )
 import pytest
 
+from custom_components.intellicenter.coordinator import DEFAULT_ATTRIBUTES_MAP
 from custom_components.intellicenter.number import PoolNumber, PumpSpeedNumber
 
 pytestmark = pytest.mark.asyncio
@@ -28,7 +29,7 @@ pytestmark = pytest.mark.asyncio
 @pytest.fixture
 def pool_model_with_intellichlor() -> PoolModel:
     """Return a PoolModel with IntelliChlor."""
-    model = PoolModel()
+    model = PoolModel(DEFAULT_ATTRIBUTES_MAP)
     model.add_objects(
         [
             {
@@ -372,7 +373,7 @@ async def test_number_no_bodies_configured(
     mock_coordinator: MagicMock,
 ) -> None:
     """Test number setup when no bodies are configured."""
-    model = PoolModel()
+    model = PoolModel(DEFAULT_ATTRIBUTES_MAP)
     model.add_objects(
         [
             {
@@ -414,7 +415,7 @@ async def test_number_no_bodies_configured(
 @pytest.fixture
 def pool_model_with_pmpcirc() -> PoolModel:
     """Return a PoolModel with a variable speed/flow pump and circuit settings."""
-    model = PoolModel()
+    model = PoolModel(DEFAULT_ATTRIBUTES_MAP)
     model.add_objects(
         [
             {
@@ -963,7 +964,7 @@ async def test_pump_speed_number_default_mode_when_none(
 @pytest.fixture
 def pool_model_with_vs_pump() -> PoolModel:
     """Return a PoolModel with a variable speed (VS) pump (RPM only)."""
-    model = PoolModel()
+    model = PoolModel(DEFAULT_ATTRIBUTES_MAP)
     model.add_objects(
         [
             {
@@ -1006,7 +1007,7 @@ def pool_model_with_vs_pump() -> PoolModel:
 @pytest.fixture
 def pool_model_with_vf_pump() -> PoolModel:
     """Return a PoolModel with a variable flow (VF) pump (GPM only)."""
-    model = PoolModel()
+    model = PoolModel(DEFAULT_ATTRIBUTES_MAP)
     model.add_objects(
         [
             {
@@ -1124,7 +1125,7 @@ async def test_number_pmpcirc_skipped_when_parent_pump_absent(
     """
     from custom_components.intellicenter.number import _build_entities
 
-    model = PoolModel()
+    model = PoolModel(DEFAULT_ATTRIBUTES_MAP)
     model.add_objects(
         [
             {
@@ -1159,3 +1160,159 @@ async def test_number_pmpcirc_skipped_when_parent_pump_absent(
         and e._pool_object.objnam == "PMPCIRC01"
     ]
     assert pmpcirc_entities == []
+
+
+# -------------------------------------------------------------------------------------
+# Body max-temperature (HITMP) entity: panel-unit-aware limits (regression)
+# -------------------------------------------------------------------------------------
+
+
+def _make_hitmp_number(mock_coordinator: MagicMock) -> PoolNumber:
+    """Build the body Max Temperature number entity like the platform does."""
+    from homeassistant.components.number import NumberDeviceClass, NumberMode
+
+    body = PoolObject(
+        "POOL1",
+        {"OBJTYP": BODY_TYPE, "SUBTYP": "POOL", "SNAME": "Pool", "HITMP": "30"},
+    )
+    return PoolNumber(
+        mock_coordinator,
+        body,
+        step=1,
+        attribute_key="HITMP",
+        name="+ Max Temperature",
+        device_class=NumberDeviceClass.TEMPERATURE,
+        mode=NumberMode.BOX,
+        integer_only=True,
+    )
+
+
+async def test_hitmp_limits_and_unit_fahrenheit(
+    hass: HomeAssistant, mock_coordinator: MagicMock
+) -> None:
+    """ENGLISH panel: 40-104 F with an explicit Fahrenheit native unit."""
+    number = _make_hitmp_number(mock_coordinator)
+
+    assert number.native_min_value == 40.0
+    assert number.native_max_value == 104.0
+    assert number.native_unit_of_measurement == "°F"
+
+
+async def test_hitmp_limits_and_unit_celsius(
+    hass: HomeAssistant, mock_coordinator: MagicMock
+) -> None:
+    """Regression: METRIC panel must allow 5-40 C, not the Fahrenheit range.
+
+    Hardcoded 40-104 bounds with no native unit made every valid Celsius
+    setpoint (5-39) raise ServiceValidationError and displayed raw values
+    without unit conversion.
+    """
+    type(mock_coordinator.system_info).uses_metric = property(lambda self: True)
+
+    number = _make_hitmp_number(mock_coordinator)
+
+    assert number.native_min_value == 5.0
+    assert number.native_max_value == 40.0
+    assert number.native_unit_of_measurement == "°C"
+    # A mid-range Celsius value reads back fine
+    assert number.native_value == 30
+
+
+# -------------------------------------------------------------------------------------
+# Service-call error handling (regression)
+# -------------------------------------------------------------------------------------
+
+
+async def test_number_set_value_connection_error_raises(
+    hass: HomeAssistant,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Regression: failures must raise, not silently 'succeed'.
+
+    async_set_native_value used to catch every exception and only log, so the
+    service call reported success while the UI value snapped back.
+    """
+    from homeassistant.exceptions import HomeAssistantError
+    from pyintellicenter import ICConnectionError
+
+    mock_coordinator.controller.set_ph_setpoint.side_effect = ICConnectionError(
+        "Not connected"
+    )
+
+    chem = PoolObject(
+        "ICHEM1",
+        {
+            "OBJTYP": CHEM_TYPE,
+            "SUBTYP": "ICHEM",
+            "SNAME": "IntelliChem",
+            "PHSET": "7.4",
+        },
+    )
+    number = PoolNumber(
+        mock_coordinator,
+        chem,
+        attribute_key="PHSET",
+        name="+ pH Setpoint",
+    )
+
+    with pytest.raises(HomeAssistantError):
+        await number.async_set_native_value(7.4)
+
+
+async def test_number_secondary_chlorinator_aborts_without_primary(
+    hass: HomeAssistant,
+    pool_object_intellichlor: PoolObject,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Regression: unknown primary output must abort, not be zeroed.
+
+    The old code defaulted a missing primary to 0 and wrote it alongside the
+    secondary value - silently turning off the primary chlorinator.
+    """
+    from homeassistant.exceptions import HomeAssistantError
+
+    mock_coordinator.controller.get_chlorinator_output.return_value = {
+        "primary": None,
+        "secondary": 30,
+    }
+
+    number = PoolNumber(
+        mock_coordinator,
+        pool_object_intellichlor,
+        attribute_key=SEC_ATTR,
+        name="+ Output % (Spa)",
+    )
+
+    with pytest.raises(HomeAssistantError):
+        await number.async_set_native_value(40)
+
+    mock_coordinator.controller.set_chlorinator_output.assert_not_called()
+
+
+async def test_number_without_device_class_always_has_the_attr(
+    hass: HomeAssistant,
+    pool_object_intellichlor: PoolObject,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Regression: _attr_device_class must exist even when none is given.
+
+    Newer HA cores declare _attr_device_class as an annotation with no class
+    default; the old conditional assignment left the attribute missing and
+    every no-device-class number raised AttributeError while being added
+    (caught live on the dev container, invisible under the pinned test HA).
+    """
+    number = PoolNumber(
+        mock_coordinator,
+        pool_object_intellichlor,
+        attribute_key=SEC_ATTR,
+        name="+ Output %",
+    )
+
+    # The attribute must be readable (HA stores it behind a descriptor; an
+    # unassigned one raises AttributeError on newer cores)...
+    assert number._attr_device_class is None
+    assert number.device_class is None
+    # ...and every capability property must be readable without raising.
+    assert number.native_min_value is not None
+    assert number.native_max_value is not None
+    assert number.native_unit_of_measurement is None

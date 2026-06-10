@@ -7,7 +7,7 @@ It supports Zeroconf discovery and local push updates for real-time responsivene
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 import contextlib
 import errno
 import logging
@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, Platform, UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import Entity
@@ -31,6 +31,7 @@ from pyintellicenter import (
     LISTORD_ATTR,
     STATUS_ATTR,
     ICConnectionError,
+    ICError,
     ICModelController,
     ICTimeoutError,
     PoolObject,
@@ -305,6 +306,27 @@ def bodies_affected_by(
     return bodies
 
 
+def safe_int(value: Any) -> int | None:
+    """Convert a device-supplied value to int, or None if it isn't numeric.
+
+    Attribute values arrive from the panel as strings and are not guaranteed to
+    parse; an unguarded int() inside an entity builder or state property can
+    take down a whole platform on one malformed value.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _heater_sort_key(heater: PoolObject) -> int:
+    """Sort heaters by LISTORD; unparsable or missing values sort last."""
+    order = safe_int(heater[LISTORD_ATTR])
+    return order if order is not None else 100
+
+
 def heaters_for_body(
     coordinator: IntelliCenterCoordinator, body_objnam: str
 ) -> list[str]:
@@ -328,13 +350,36 @@ def heaters_for_body(
     """
     heaters = sorted(
         coordinator.model.get_by_type(HEATER_TYPE),
-        key=lambda h: int(h[LISTORD_ATTR]) if h[LISTORD_ATTR] else 100,
+        key=_heater_sort_key,
     )
     return [
         heater.objnam
         for heater in heaters
         if body_objnam in (heater[BODY_ATTR] or "").split(" ")
     ]
+
+
+def body_temperature_limits(
+    coordinator: IntelliCenterCoordinator,
+) -> tuple[float, float]:
+    """Return the valid body temperature setpoint range in the panel's unit.
+
+    IntelliCenter accepts body setpoints of 40-104 °F; on METRIC systems the
+    equivalent 5-40 °C. This is the single source for every platform exposing
+    body temperature setpoints (water_heater, climate, number/HITMP) - the
+    limits were previously hard-coded per platform and had drifted (a 4 °F
+    floor typo in water_heater).
+
+    Args:
+        coordinator: The coordinator providing the system info.
+
+    Returns:
+        (min, max) in the panel's native temperature unit.
+    """
+    system_info = coordinator.system_info
+    if system_info is not None and system_info.uses_metric:
+        return (5.0, 40.0)
+    return (40.0, 104.0)
 
 
 # -------------------------------------------------------------------------------------
@@ -351,6 +396,12 @@ class PoolEntity(CoordinatorEntity[IntelliCenterCoordinator], Entity):
 
     _attr_has_entity_name = True
     _attr_should_poll = False
+
+    # Optimistic on/off state rendered ahead of the device echo; None means
+    # "render the real model state". Owned here (not on the mixin) so the
+    # clear-on-update/-failure hooks below work for every subclass regardless
+    # of MRO ordering.
+    _optimistic_state: bool | None = None
 
     def __init__(
         self,
@@ -513,7 +564,14 @@ class PoolEntity(CoordinatorEntity[IntelliCenterCoordinator], Entity):
         )
 
     async def _async_request_changes(self, changes: dict[str, Any]) -> None:
-        """Async helper to request changes with error handling."""
+        """Async helper to request changes with error handling.
+
+        Runs as a fire-and-forget task, so a failure cannot be raised back to
+        the service call. Instead, any optimistic state is reverted and the
+        entity re-rendered from the model - otherwise a failed command (e.g.
+        issued while the connection drops) would leave the UI showing a state
+        the device never reached, with no push update ever clearing it.
+        """
         try:
             await self._controller.request_changes(self._pool_object.objnam, changes)
         except Exception:
@@ -522,6 +580,23 @@ class PoolEntity(CoordinatorEntity[IntelliCenterCoordinator], Entity):
                 self._pool_object.objnam,
                 changes,
             )
+            self._clear_optimistic_state()
+            self.async_write_ha_state()
+
+    async def _async_execute_command(self, command: Awaitable[Any]) -> Any:
+        """Await a controller command, surfacing failures as HomeAssistantError.
+
+        pyintellicenter raises ICError subclasses (connection lost, command
+        rejected, request timeout) and ValueError (setpoint validation); none
+        of them subclass HomeAssistantError, so without this conversion a
+        failed service call surfaces as a raw 'Unknown error' traceback.
+        """
+        try:
+            return await command
+        except (ICError, ValueError) as err:
+            raise HomeAssistantError(
+                f"IntelliCenter command for '{self.name}' failed: {err}"
+            ) from err
 
     def _check_attributes_updated(
         self, updates: dict[str, dict[str, Any]], *attributes: str
@@ -547,13 +622,25 @@ class PoolEntity(CoordinatorEntity[IntelliCenterCoordinator], Entity):
             updated_obj = self.coordinator.model[self._pool_object.objnam]
             if updated_obj:
                 self._pool_object = updated_obj
-            # Clear optimistic state if this entity uses OnOffControlMixin
-            if hasattr(self, "_clear_optimistic_state"):
-                self._clear_optimistic_state()
+            self._clear_optimistic_state()
             self.async_write_ha_state()
         elif not updates:
-            # Connection state change - update availability
+            # Connection event (the coordinator cleared its diff): re-render every
+            # entity so availability changes take effect, and drop any optimistic
+            # state - after a reconnect the model is the fresh source of truth, and
+            # a command issued around a disconnect may never produce the echo update
+            # that would otherwise clear it.
+            self._clear_optimistic_state()
             self.async_write_ha_state()
+
+    @callback
+    def _clear_optimistic_state(self) -> None:
+        """Clear any optimistic state once authoritative data arrives.
+
+        Harmless for entities that never render optimistically (the attribute
+        stays None for them).
+        """
+        self._optimistic_state = None
 
     def pentairTemperatureSettings(self) -> str:
         """Return the native temperature unit from the Pentair system.
@@ -579,15 +666,6 @@ class PoolEntity(CoordinatorEntity[IntelliCenterCoordinator], Entity):
         except (ValueError, TypeError):
             return None
 
-    def _safe_int_conversion(self, value: Any) -> int | None:
-        """Safely convert a value to int."""
-        if value is None:
-            return None
-        try:
-            return int(value)
-        except (ValueError, TypeError):
-            return None
-
 
 # -------------------------------------------------------------------------------------
 # On/Off Control Mixin
@@ -596,7 +674,7 @@ class PoolEntity(CoordinatorEntity[IntelliCenterCoordinator], Entity):
 
 # Under static type checking the mixin is treated as an ``Entity`` subclass so
 # mypy can resolve the ``Entity`` members it uses (``hass``,
-# ``async_write_ha_state``) without re-declaring them - re-declaring
+# ``async_write_ha_state``) without redeclaring them - redeclaring
 # ``async_write_ha_state`` would clash with its ``@final`` marker on ``Entity``.
 # At runtime the mixin stays a plain ``object`` subclass, so the method
 # resolution order of the concrete entity classes is unchanged.
@@ -609,13 +687,14 @@ else:
 class OnOffControlMixin(_MixinBase):
     """Mixin for entities with simple on/off control.
 
-    Classes using this mixin must also inherit from PoolEntity.
-    Implements optimistic updates for immediate UI feedback.
+    Classes using this mixin must also inherit from PoolEntity, which owns the
+    optimistic-state attribute and its clearing hooks (on real updates,
+    connection events, and failed fire-and-forget commands).
     """
 
     _pool_object: PoolObject
     _attribute_key: str
-    _optimistic_state: bool | None = None  # None = use real state
+    _optimistic_state: bool | None
 
     if TYPE_CHECKING:
 
@@ -650,8 +729,3 @@ class OnOffControlMixin(_MixinBase):
         self._optimistic_state = False
         self.async_write_ha_state()
         self.request_changes({self._attribute_key: self._pool_object.off_status})
-
-    @callback
-    def _clear_optimistic_state(self) -> None:
-        """Clear optimistic state when real update is received."""
-        self._optimistic_state = None

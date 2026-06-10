@@ -31,7 +31,13 @@ from homeassistant.helpers.selector import (
     SelectSelectorMode,
 )
 from homeassistant.helpers.service_info.zeroconf import ZeroconfServiceInfo
-from pyintellicenter import ICBaseController, ICConnectionError, ICSystemInfo
+from pyintellicenter import (
+    ICBaseController,
+    ICCommandError,
+    ICConnectionError,
+    ICSystemInfo,
+    ICTimeoutError,
+)
 import voluptuous as vol
 
 # Import discovery - available in pyintellicenter 0.0.4+
@@ -136,13 +142,15 @@ class ConfigFlow(HAConfigFlow, domain=DOMAIN):
             # User selected a device from the list
             selected = user_input.get("device")
             if selected:
-                # Find the selected unit
-                for unit in self._discovered_units:
-                    if unit.host == selected:
-                        return await self._async_create_entry_from_unit(unit)
-
-                # Try to connect with the selected host
                 try:
+                    # A unit discovered earlier: connect to it. This must stay
+                    # inside the try so a connection failure re-shows the picker
+                    # with an error instead of crashing the flow.
+                    for unit in self._discovered_units:
+                        if unit.host == selected:
+                            return await self._async_create_entry_from_unit(unit)
+
+                    # Otherwise try to connect with the selected host
                     host = _validate_host(selected)
                     system_info = await self._get_system_info(host)
 
@@ -387,20 +395,21 @@ class ConfigFlow(HAConfigFlow, domain=DOMAIN):
         )
 
     async def _async_create_entry_from_unit(self, unit: ICUnit) -> ConfigFlowResult:
-        """Create a config entry from a discovered unit."""
-        try:
-            system_info = await self._get_system_info(unit.host)
+        """Create a config entry from a discovered unit.
 
-            await self.async_set_unique_id(system_info.unique_id)
-            self._abort_if_unique_id_configured()
+        Raises:
+            AbortFlow: If the unit is already configured.
+            CannotConnect: If the unit cannot be reached; callers map this to a
+                form error.
+        """
+        system_info = await self._get_system_info(unit.host)
 
-            return self.async_create_entry(
-                title=system_info.prop_name, data={CONF_HOST: unit.host}
-            )
-        except AbortFlow:
-            raise
-        except CannotConnect as err:
-            raise CannotConnect from err
+        await self.async_set_unique_id(system_info.unique_id)
+        self._abort_if_unique_id_configured()
+
+        return self.async_create_entry(
+            title=system_info.prop_name, data={CONF_HOST: unit.host}
+        )
 
     async def _get_system_info(
         self, host: str, transport: TransportType = DEFAULT_TRANSPORT
@@ -428,7 +437,14 @@ class ConfigFlow(HAConfigFlow, domain=DOMAIN):
             ConnectionRefusedError,
             OSError,
             TimeoutError,
+            # All pyintellicenter failures while talking to the panel mean "this
+            # host cannot be set up right now": ICTimeoutError/ICCommandError
+            # subclass ICError, NOT the builtin TimeoutError, so without these a
+            # slow or rejecting panel surfaced as 'unknown' (or crashed the
+            # discover path) instead of 'cannot_connect'.
+            ICCommandError,
             ICConnectionError,
+            ICTimeoutError,
         ) as err:
             raise CannotConnect from err
         finally:
@@ -459,6 +475,14 @@ class ConfigFlow(HAConfigFlow, domain=DOMAIN):
                 transport = user_input.get(CONF_TRANSPORT, DEFAULT_TRANSPORT)
                 system_info = await self._get_system_info(host, transport)
 
+                # The entry must keep pointing at the SAME panel: silently
+                # rebinding it to different hardware would corrupt entity
+                # history and lets a later zeroconf rediscovery of the original
+                # panel flip CONF_HOST back - the host would oscillate between
+                # two devices with no error shown.
+                await self.async_set_unique_id(system_info.unique_id)
+                self._abort_if_unique_id_mismatch(reason="unique_id_mismatch")
+
                 # Check if this host is different and not already configured
                 if host != reconfigure_entry.data.get(CONF_HOST):
                     # Check if another entry uses this host
@@ -474,6 +498,10 @@ class ConfigFlow(HAConfigFlow, domain=DOMAIN):
                     title=system_info.prop_name,
                     data={CONF_HOST: host, CONF_TRANSPORT: transport},
                 )
+            except AbortFlow:
+                # e.g. unique_id_mismatch - must reach the flow manager, not
+                # the generic 'unknown' bucket below.
+                raise
             except InvalidHost:
                 errors["base"] = "invalid_host"
             except CannotConnect:

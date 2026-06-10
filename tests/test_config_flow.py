@@ -441,11 +441,13 @@ async def test_reconfigure_flow_host_already_configured(
     hass: HomeAssistant, mock_controller: MagicMock
 ) -> None:
     """Test reconfigure flow when new host is already configured by another entry."""
-    # Create two entries
+    # Create two entries. entry1 carries the unique_id the mocked panel
+    # reports so the reconfigure identity guard passes and the flow reaches
+    # the host-conflict check.
     entry1 = MockConfigEntry(
         domain=DOMAIN,
         data={CONF_HOST: "192.168.1.99"},
-        unique_id="unique-id-1",
+        unique_id="test-unique-id-123",
     )
     entry1.add_to_hass(hass)
 
@@ -466,3 +468,139 @@ async def test_reconfigure_flow_host_already_configured(
 
     assert result["type"] == FlowResultType.ABORT
     assert result["reason"] == "already_configured"
+
+
+# -------------------------------------------------------------------------------------
+# Discover step (library-based discovery) and exception-mapping regressions
+# -------------------------------------------------------------------------------------
+
+
+def _patch_discovery(units):
+    """Patch the discovery helpers used by the discover step."""
+    from unittest.mock import AsyncMock, patch as mock_patch
+
+    return (
+        mock_patch(
+            "custom_components.intellicenter.config_flow.discover_intellicenter_units",
+            AsyncMock(return_value=units),
+        ),
+        mock_patch(
+            "custom_components.intellicenter.config_flow.zeroconf.async_get_instance",
+            AsyncMock(return_value=MagicMock()),
+        ),
+    )
+
+
+async def test_discover_flow_success(
+    hass: HomeAssistant, mock_controller: MagicMock
+) -> None:
+    """Selecting a discovered unit creates an entry."""
+    from pyintellicenter import ICUnit
+
+    unit = ICUnit(name="IntelliCenter", host="192.168.1.50", port=6681, ws_port=6680)
+    discovery_patch, zc_patch = _patch_discovery([unit])
+
+    with discovery_patch, zc_patch:
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"setup_method": "discover"}
+        )
+        assert result["type"] == FlowResultType.FORM
+        assert result["step_id"] == "discover"
+
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"device": "192.168.1.50"}
+        )
+
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_HOST] == "192.168.1.50"
+
+
+async def test_discover_flow_selected_unit_cannot_connect(
+    hass: HomeAssistant, mock_controller: MagicMock
+) -> None:
+    """Regression: a failing discovered unit re-shows the form, not a crash.
+
+    The unit-selection call used to sit outside the step's try/except while the
+    helper deliberately re-raised CannotConnect, so the flow died with a
+    generic 'unknown error' dialog instead of showing cannot_connect.
+    """
+    from pyintellicenter import ICUnit
+
+    unit = ICUnit(name="IntelliCenter", host="192.168.1.50", port=6681, ws_port=6680)
+    discovery_patch, zc_patch = _patch_discovery([unit])
+    mock_controller.start.side_effect = ConnectionRefusedError()
+
+    with discovery_patch, zc_patch:
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"setup_method": "discover"}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"device": "192.168.1.50"}
+        )
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["step_id"] == "discover"
+    assert result["errors"] == {"base": "cannot_connect"}
+
+
+async def test_user_flow_ic_timeout_maps_to_cannot_connect(
+    hass: HomeAssistant, mock_controller: MagicMock
+) -> None:
+    """Regression: ICTimeoutError is a connection problem, not 'unknown'.
+
+    ICTimeoutError subclasses ICError, NOT the builtin TimeoutError, so the
+    old except tuple missed it and a slow-to-answer panel showed 'unknown'.
+    """
+    from pyintellicenter import ICTimeoutError
+
+    mock_controller.start.side_effect = ICTimeoutError("GetParamList timed out")
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"setup_method": "manual"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_HOST: "192.168.1.100"}
+    )
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["step_id"] == "manual"
+    assert result["errors"] == {"base": "cannot_connect"}
+
+
+async def test_reconfigure_flow_rejects_different_panel(
+    hass: HomeAssistant, mock_controller: MagicMock
+) -> None:
+    """Regression: reconfigure must not silently rebind to different hardware.
+
+    Without the identity guard, pointing the entry at another panel kept the
+    old unique_id, and a later zeroconf rediscovery of the original panel
+    would flip CONF_HOST back - the host oscillated between two devices.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_HOST: "192.168.1.99"},
+        unique_id="the-original-panel",
+    )
+    entry.add_to_hass(hass)
+
+    # The mocked controller reports a DIFFERENT panel identity
+    # ("test-unique-id-123") for the new host.
+    result = await entry.start_reconfigure_flow(hass)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_HOST: "192.168.1.42"},
+    )
+
+    assert result["type"] == FlowResultType.ABORT
+    assert result["reason"] == "unique_id_mismatch"
+    # The entry was not rebound.
+    assert entry.data[CONF_HOST] == "192.168.1.99"
