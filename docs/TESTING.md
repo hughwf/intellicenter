@@ -4,7 +4,7 @@ This document describes the automated testing infrastructure for the Pentair Int
 
 ## Test Framework
 
-This project uses `pytest` with the `pytest-homeassistant-custom-component` framework for automated testing. The integration test suite (257 tests across 13 files) covers:
+This project uses `pytest` with the `pytest-homeassistant-custom-component` framework for automated testing. The integration test suite (323 tests across 14 files) covers:
 
 - **Config Flow Tests**: User setup, Zeroconf discovery, error handling
 - **Integration/Setup Tests**: Entry setup and unload, retry on transient connection errors, connection handler behavior
@@ -211,31 +211,32 @@ Diagnostic export tests (10 tests):
 
 ### Current Coverage
 
-**Total Tests**: 257 tests across 13 test files
+**Total Tests**: 323 tests across 14 test files
 
 | Component | Tests | Status |
 |-----------|-------|--------|
-| Light Platform | 47 tests | ✅ Complete |
-| Water Heater | 46 tests | ✅ Complete |
-| Number Platform | 33 tests | ✅ Complete |
-| Climate Platform | 22 tests | ✅ Complete |
-| Integration / Setup | 21 tests | ✅ Complete |
-| Sensor Platform | 18 tests | ✅ Complete |
-| Cover Platform | 17 tests | ✅ Complete |
-| Binary Sensor | 15 tests | ✅ Complete |
-| Config Flow | 13 tests | ✅ Complete |
-| Switch Platform | 11 tests | ✅ Complete |
+| Light Platform | 50 tests | ✅ Complete |
+| Water Heater | 48 tests | ✅ Complete |
+| Number Platform | 39 tests | ✅ Complete |
+| Sensor Platform | 37 tests | ✅ Complete |
+| Integration / Setup | 24 tests | ✅ Complete |
+| Climate Platform | 24 tests | ✅ Complete |
+| Cover Platform | 19 tests | ✅ Complete |
+| Config Flow | 19 tests | ✅ Complete |
+| Dynamic Entities | 18 tests | ✅ Complete |
+| Binary Sensor | 17 tests | ✅ Complete |
+| Switch Platform | 13 tests | ✅ Complete |
 | Diagnostics | 10 tests | ✅ Complete |
-| Library Contract | 2 tests | ✅ Complete |
+| Library Contract | 3 tests | ✅ Complete |
 | Version Sync | 2 tests | ✅ Complete |
-| **Total** | **257 tests** | ✅ Complete |
+| **Total** | **323 tests** | ✅ Complete |
 
 > Protocol, controller, and model tests are maintained in the standalone
 > [pyintellicenter](https://github.com/joyfulhouse/pyintellicenter) repository and are not counted here.
 
 ### Gold Quality Requirements Met
 
-✅ **Extensive automated test coverage** - 257 tests covering:
+✅ **Extensive automated test coverage** - 323 tests covering:
   - Config flow (user + Zeroconf)
   - Integration setup, unload, and retry-on-transient-error
   - Platform entity creation across all platforms
