@@ -32,12 +32,15 @@ This integration connects your Pentair IntelliCenter pool control system to Home
 - **Multi-Language**: User interface available in 12 languages
 - **Easy Reconfiguration**: Change connection settings without removing the integration
 
-## What's New in v3.7.0
+## What's New in v3.8.0
 
-This release adds hybrid heater support and improves setup reliability:
+This release adds the per-body Last Temp sensor and hardens connection, cover, config-flow, and temperature-limit handling:
 
-- **HCOMBO Multi-Mode Heaters**: UltraTemp ETi Hybrid (HCOMBO) heaters now expose Gas Only, Heat Pump Only, Hybrid, and Dual operation modes. The last-used operation is remembered and restored on turn-on, and bodies that combine an HCOMBO with a standard heater are fully supported.
-- **Resilient Setup**: Transient connection failures during startup now trigger Home Assistant's automatic retry with backoff instead of a permanent setup error, so the integration recovers on its own when the IntelliCenter is briefly unreachable.
+- **Body "Last Temp" Sensor**: Each body (Pool, Spa) now has a "Last Temp" sensor (e.g. *Pool Last Temp*) showing the IntelliCenter body's last recorded water temperature. Unlike the physical Water Sensor — whose probe sits in an above-ground pipe and reads colder when the pump is off — the Last Temp value holds the last circulating temperature, so it stays accurate while the pump is idle. Thanks to @sheyman1 for the request (#75).
+- **Reliable Availability**: Connection up/down now updates every entity, so values can no longer go stale during an outage or stick as unavailable after a reconnect.
+- **Pool Covers on Real Hardware**: External-instrument pool covers (`EXTINSTR`) are now created on actual systems (previously only appeared in tests).
+- **Resilient Config Flow**: A discovered unit that fails to connect re-shows the picker with a clear error instead of a generic 500.
+- **Panel-Aware Temperature Limits**: Water heater, climate, and the Max Temperature control share one set of unit-aware bounds (40-104 °F / 5-40 °C), fixing a spa minimum-temperature bug and METRIC-panel setpoints.
 
 ## Architecture
 
@@ -367,7 +370,7 @@ This integration meets the **Platinum tier** quality standards for Home Assistan
 **Gold Requirements:**
 - Full translation support (12 languages)
 - Easy reconfiguration through the UI
-- Comprehensive automated testing (257 tests)
+- Comprehensive automated testing (323 tests)
 - Extensive user-friendly documentation
 - Automatic Zeroconf discovery
 
