@@ -1,6 +1,17 @@
 """Pentair Intellicenter covers.
 
 This module provides cover entities for pool covers and other motorized covers.
+
+Attribute semantics (confirmed by capturing the panel web UI's own
+SETPARAMLIST traffic — see joyfulhouse/pyintellicenter#44):
+
+- ``STATUS`` is the "Cover Enabled" flag from Settings > Covers. It is
+  configuration, never position.
+- ``POSIT`` is the physical cover position. Older firmware (e.g. IC 1.064,
+  verified live) omits POSIT entirely; on such panels there is NO live
+  position signal, so position is unknown and position commands are refused
+  rather than fabricated from STATUS (writing STATUS would toggle the
+  cover's enabled flag in the panel's settings, not move the cover).
 """
 
 from __future__ import annotations
@@ -15,10 +26,12 @@ from homeassistant.components.cover import (
     CoverEntityFeature,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from pyintellicenter import (
     EXTINSTR_TYPE,
     NORMAL_ATTR,
+    POSIT_ATTR,
     STATUS_ATTR,
     STATUS_OFF,
     STATUS_ON,
@@ -26,6 +39,7 @@ from pyintellicenter import (
 )
 
 from . import IntelliCenterConfigEntry, PoolEntity, async_setup_pool_entities
+from .const import DOMAIN
 from .coordinator import IntelliCenterCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -39,12 +53,19 @@ PARALLEL_UPDATES = 0
 def _build_entities(
     coordinator: IntelliCenterCoordinator, candidates: Iterable[PoolObject]
 ) -> list[PoolCover]:
-    """Build cover entities for the given candidate pool objects."""
-    covers: list[PoolCover] = []
-    for pool_obj in candidates:
-        if pool_obj.objtype == EXTINSTR_TYPE and pool_obj.subtype == "COVER":
-            covers.append(PoolCover(coordinator, pool_obj))
-    return covers
+    """Build cover entities for the given candidate pool objects.
+
+    Entities are created for every EXTINSTR/COVER object — including covers
+    disabled in Settings > Covers — and gated through ``available`` instead.
+    Creating them all keeps existing users' entity registry stable and means
+    a cover enabled after setup comes alive on the next push (STATUS updates
+    an existing object, which would never re-trigger entity creation).
+    """
+    return [
+        PoolCover(coordinator, pool_obj)
+        for pool_obj in candidates
+        if pool_obj.objtype == EXTINSTR_TYPE and pool_obj.subtype == "COVER"
+    ]
 
 
 async def async_setup_entry(
@@ -86,31 +107,80 @@ class PoolCover(PoolEntity, CoverEntity):
         )
 
     @property
-    def is_closed(self) -> bool | None:
-        """Return true if cover is closed, or None if the state is unknown."""
-        # Without both attributes the position cannot be derived; report unknown
-        # rather than fabricating "closed" (safety automations may key off this).
-        raw_status = self._pool_object[STATUS_ATTR]
+    def available(self) -> bool:
+        """Return whether the panel is connected and the cover is enabled.
+
+        STATUS is the Settings > Covers enabled flag; a disabled cover is a
+        configuration placeholder, not controllable equipment. Only an
+        explicit OFF hides the entity — a cover missing STATUS entirely
+        (unobserved, but protocol-plausible) fails open rather than becoming
+        permanently unavailable.
+        """
+        return super().available and self._pool_object.status != STATUS_OFF
+
+    def _valid_position_state(self) -> tuple[bool, bool] | None:
+        """Return (posit_is_on, normal_is_on), or None if either is invalid.
+
+        Position comes exclusively from POSIT. Older firmware (e.g. IC 1.064)
+        omits POSIT, leaving no live position signal. NORMAL is equally
+        load-bearing: it decides the open/close *direction*, so a missing or
+        malformed value must invalidate the state rather than silently read
+        as OFF (which would reverse commands on a partially synced cover).
+        """
+        raw_position = self._pool_object[POSIT_ATTR]
         raw_normal = self._pool_object[NORMAL_ATTR]
-        if raw_status is None or raw_normal is None:
+        valid = (STATUS_ON, STATUS_OFF)
+        if raw_position not in valid or raw_normal not in valid:
             return None
+        return (raw_position == STATUS_ON, raw_normal == STATUS_ON)
+
+    @property
+    def is_closed(self) -> bool | None:
+        """Return true if cover is closed, or None if the state is unknown.
+
+        Reports unknown rather than fabricating a state from the STATUS
+        enabled flag or malformed values (safety automations may key off
+        this).
+        """
+        state = self._valid_position_state()
+        if state is None:
+            return None
+        posit_on, normal_on = state
         # The cover is closed if:
-        # - STATUS is ON and NORMAL is ON (cover is normally closed)
-        # - STATUS is OFF and NORMAL is OFF (cover is normally open)
-        return bool((raw_status == STATUS_ON) == (raw_normal == STATUS_ON))
+        # - POSIT is ON and NORMAL is ON (cover is normally closed)
+        # - POSIT is OFF and NORMAL is OFF (cover is normally open)
+        return posit_on == normal_on
+
+    def _require_actuation_support(self) -> tuple[bool, bool]:
+        """Return validated (posit_is_on, normal_is_on) or raise.
+
+        Without a valid POSIT there is no position channel to write (falling
+        back to STATUS would flip the cover's enabled flag in Settings >
+        Covers instead of moving it), and without a valid NORMAL the command
+        direction would be guessed.
+        """
+        state = self._valid_position_state()
+        if state is None:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="cover_position_unsupported",
+            )
+        return state
 
     async def async_open_cover(self, **kwargs: Any) -> None:
         """Open the cover."""
-        # To open the cover, we need to set STATUS opposite of NORMAL
-        normal = self._pool_object[NORMAL_ATTR] == STATUS_ON
-        self.request_changes({STATUS_ATTR: STATUS_OFF if normal else STATUS_ON})
+        _, normal_on = self._require_actuation_support()
+        # To open the cover, set its position opposite of NORMAL.
+        self.request_changes({POSIT_ATTR: STATUS_OFF if normal_on else STATUS_ON})
 
     async def async_close_cover(self, **kwargs: Any) -> None:
         """Close the cover."""
-        # To close the cover, we need to set STATUS same as NORMAL
-        normal = self._pool_object[NORMAL_ATTR] == STATUS_ON
-        self.request_changes({STATUS_ATTR: STATUS_ON if normal else STATUS_OFF})
+        _, normal_on = self._require_actuation_support()
+        # To close the cover, set its position to the same value as NORMAL.
+        self.request_changes({POSIT_ATTR: STATUS_ON if normal_on else STATUS_OFF})
 
     def isUpdated(self, updates: dict[str, dict[str, str]]) -> bool:
         """Return true if the entity is updated by the updates from Intellicenter."""
-        return self._check_attributes_updated(updates, STATUS_ATTR, NORMAL_ATTR)
+        return self._check_attributes_updated(
+            updates, STATUS_ATTR, POSIT_ATTR, NORMAL_ATTR
+        )
