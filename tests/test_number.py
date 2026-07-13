@@ -2,8 +2,9 @@
 
 from unittest.mock import MagicMock
 
-from homeassistant.const import PERCENTAGE
+from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfTime
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from pyintellicenter import (
     BODY_TYPE,
     CHEM_TYPE,
@@ -15,15 +16,29 @@ from pyintellicenter import (
     SEC_ATTR,
     SELECT_ATTR,
     SPEED_ATTR,
+    TIME_ATTR,
+    TIMOUT_ATTR,
     PoolModel,
     PoolObject,
 )
 import pytest
 
+from custom_components.intellicenter.const import PRIMFLO_ATTR, PRIMTIM_ATTR
 from custom_components.intellicenter.coordinator import DEFAULT_ATTRIBUTES_MAP
-from custom_components.intellicenter.number import PoolNumber, PumpSpeedNumber
+from custom_components.intellicenter.number import (
+    PoolNumber,
+    PumpPrimingNumber,
+    PumpSpeedNumber,
+    SuperChlorinateDurationNumber,
+    _build_entities,
+)
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_circuit_dont_stop_attribute_is_tracked() -> None:
+    """PoolModel retains the Don't Stop setting for user circuits."""
+    assert "DNTSTP" in DEFAULT_ATTRIBUTES_MAP[CIRCUIT_TYPE]
 
 
 @pytest.fixture
@@ -103,8 +118,220 @@ async def test_number_setup_creates_entities(
 
     await async_setup_entry(hass, mock_entry, capture_entities)
 
-    # Should create 2 number entities (one for each body)
-    assert len(entities_added) == 2
+    # Two body outputs plus one superchlorinate duration control.
+    assert len(entities_added) == 3
+
+
+async def test_superchlorinate_duration_created_without_runtime_value(
+    hass: HomeAssistant,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Every IntelliChlor gets a stable duration entity before TIMOUT arrives."""
+    chlor = PoolObject(
+        "ICHLOR1",
+        {"OBJTYP": CHEM_TYPE, "SUBTYP": "ICHLOR", "SNAME": "IntelliChlor"},
+    )
+
+    numbers = _build_entities(mock_coordinator, [chlor])
+
+    durations = [
+        number
+        for number in numbers
+        if isinstance(number, SuperChlorinateDurationNumber)
+    ]
+    assert len(durations) == 1
+    number = durations[0]
+    assert number.name == "IntelliChlor Superchlorinate Duration"
+    assert number.unique_id == "test_entry_ICHLOR1TIMOUT"
+    assert number.entity_category == EntityCategory.CONFIG
+    assert number.native_unit_of_measurement == UnitOfTime.HOURS
+    assert number.native_min_value == 1
+    assert number.native_max_value == 96
+    assert number.native_step == 1
+    assert number.entity_registry_enabled_default is True
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("86400", 24.0),
+        ("3600", 1.0),
+        (None, None),
+        ("bad", None),
+        ("nan", None),
+        ("1800", None),
+        ("349200", None),
+    ],
+)
+async def test_superchlorinate_duration_state_mapping(
+    hass: HomeAssistant,
+    mock_coordinator: MagicMock,
+    raw: str | None,
+    expected: float | None,
+) -> None:
+    """TIMOUT seconds are exposed as hours, with invalid values unknown."""
+    chlor = PoolObject(
+        "ICHLOR1",
+        {
+            "OBJTYP": CHEM_TYPE,
+            "SUBTYP": "ICHLOR",
+            "SNAME": "IntelliChlor",
+            TIMOUT_ATTR: raw,
+        },
+    )
+    number = SuperChlorinateDurationNumber(mock_coordinator, chlor)
+
+    assert number.native_value == expected
+
+
+async def test_superchlorinate_duration_write(
+    hass: HomeAssistant,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Writing hours sends TIMOUT in protocol seconds."""
+    chlor = PoolObject(
+        "ICHLOR1",
+        {"OBJTYP": CHEM_TYPE, "SUBTYP": "ICHLOR", "SNAME": "IntelliChlor"},
+    )
+    number = SuperChlorinateDurationNumber(mock_coordinator, chlor)
+
+    await number.async_set_native_value(12)
+
+    mock_coordinator.controller.request_changes.assert_awaited_once_with(
+        "ICHLOR1", {TIMOUT_ATTR: "43200"}
+    )
+
+
+async def test_superchlorinate_duration_write_error_is_translated(
+    hass: HomeAssistant,
+    mock_coordinator: MagicMock,
+) -> None:
+    """A failed duration write surfaces a translated service error."""
+    from pyintellicenter import ICConnectionError
+
+    chlor = PoolObject(
+        "ICHLOR1",
+        {"OBJTYP": CHEM_TYPE, "SUBTYP": "ICHLOR", "SNAME": "IntelliChlor"},
+    )
+    mock_coordinator.controller.request_changes.side_effect = ICConnectionError(
+        "offline"
+    )
+    number = SuperChlorinateDurationNumber(mock_coordinator, chlor)
+
+    with pytest.raises(HomeAssistantError) as err:
+        await number.async_set_native_value(12)
+
+    assert err.value.translation_domain == "intellicenter"
+    assert err.value.translation_key == "command_failed"
+
+
+@pytest.mark.parametrize("value", [0.0, 97.0, 12.5])
+async def test_superchlorinate_duration_refuses_invalid_value(
+    hass: HomeAssistant,
+    mock_coordinator: MagicMock,
+    value: float,
+) -> None:
+    """Duration writes outside the documented whole-hour range are refused."""
+    chlor = PoolObject(
+        "ICHLOR1",
+        {"OBJTYP": CHEM_TYPE, "SUBTYP": "ICHLOR", "SNAME": "IntelliChlor"},
+    )
+    number = SuperChlorinateDurationNumber(mock_coordinator, chlor)
+
+    with pytest.raises(HomeAssistantError) as err:
+        await number.async_set_native_value(value)
+
+    assert err.value.translation_domain == "intellicenter"
+    assert err.value.translation_key == "invalid_superchlorinate_duration"
+    mock_coordinator.controller.request_changes.assert_not_called()
+
+
+async def test_egg_timer_number_created_for_every_user_circuit(
+    hass: HomeAssistant,
+    pool_model: PoolModel,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Featured, non-featured, and light circuits all get egg timers."""
+    from custom_components.intellicenter.number import _build_entities
+
+    mock_coordinator.model = pool_model
+    entities = _build_entities(mock_coordinator, list(pool_model))
+    egg_timers = [entity for entity in entities if entity._attribute_key == TIME_ATTR]
+
+    objnams = {entity._pool_object.objnam for entity in egg_timers}
+    assert {"CIRC01", "CIRC02", "LIGHT1", "LIGHT2", "SHOW1"} <= objnams
+    assert all(not entity.entity_registry_enabled_default for entity in egg_timers)
+    assert all(entity.entity_category == EntityCategory.CONFIG for entity in egg_timers)
+
+
+async def test_egg_timer_number_properties_and_write(
+    hass: HomeAssistant,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Egg timer is a 1-720 minute integer CONFIG control writing TIME."""
+    circuit = PoolObject(
+        "AUX4",
+        {
+            "OBJTYP": CIRCUIT_TYPE,
+            "SUBTYP": "GENERIC",
+            "SNAME": "AUX 4",
+            "TIME": "60",
+        },
+    )
+    number = PoolNumber(
+        mock_coordinator,
+        circuit,
+        min_value=1,
+        max_value=720,
+        step=1,
+        attribute_key=TIME_ATTR,
+        name="+ Egg Timer",
+        unit_of_measurement=UnitOfTime.MINUTES,
+        entity_category=EntityCategory.CONFIG,
+        integer_only=True,
+        enabled_by_default=False,
+    )
+    number.hass = hass
+
+    assert number.name == "AUX 4 Egg Timer"
+    assert number.native_value == 60
+    assert number.native_min_value == 1
+    assert number.native_max_value == 720
+    assert number.native_step == 1
+    assert number.native_unit_of_measurement == UnitOfTime.MINUTES
+    assert number.entity_registry_enabled_default is False
+
+    await number.async_set_native_value(90)
+    await hass.async_block_till_done()
+    mock_coordinator.controller.request_changes.assert_called_once_with(
+        "AUX4", {TIME_ATTR: "90"}
+    )
+
+
+@pytest.mark.parametrize("raw_value", [None, "not-a-number"])
+async def test_egg_timer_missing_or_malformed_value_is_unknown(
+    hass: HomeAssistant,
+    mock_coordinator: MagicMock,
+    raw_value: str | None,
+) -> None:
+    """Missing and malformed egg timer values map to unknown."""
+    circuit = PoolObject(
+        "AUX4",
+        {
+            "OBJTYP": CIRCUIT_TYPE,
+            "SUBTYP": "GENERIC",
+            "SNAME": "AUX 4",
+            "TIME": raw_value,
+        },
+    )
+    number = PoolNumber(
+        mock_coordinator,
+        circuit,
+        attribute_key=TIME_ATTR,
+        integer_only=True,
+    )
+
+    assert number.native_value is None
 
 
 async def test_number_entity_properties_primary(
@@ -405,8 +632,9 @@ async def test_number_no_bodies_configured(
 
     await async_setup_entry(hass, mock_entry, capture_entities)
 
-    # Should create no entities when no bodies configured
-    assert len(entities_added) == 0
+    # Output controls need a body, but the object-level duration remains stable.
+    assert len(entities_added) == 1
+    assert isinstance(entities_added[0], SuperChlorinateDurationNumber)
 
 
 # --- Pump Speed Control Tests ---
@@ -1316,3 +1544,112 @@ async def test_number_without_device_class_always_has_the_attr(
     assert number.native_min_value is not None
     assert number.native_max_value is not None
     assert number.native_unit_of_measurement is None
+
+
+async def test_pump_priming_numbers_created_unconditionally(
+    hass: HomeAssistant,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Each pump gets disabled-by-default priming speed and duration controls."""
+    pump = PoolObject(
+        "PUMP1",
+        {
+            "OBJTYP": PUMP_TYPE,
+            "SNAME": "Pool Pump",
+            "MIN": "600",
+            "MAX": "3200",
+        },
+    )
+
+    priming = [
+        item
+        for item in _build_entities(mock_coordinator, [pump])
+        if isinstance(item, PumpPrimingNumber)
+    ]
+
+    assert {item._attribute_key for item in priming} == {
+        PRIMFLO_ATTR,
+        PRIMTIM_ATTR,
+    }
+    assert all(item.entity_category == EntityCategory.CONFIG for item in priming)
+    assert all(not item.entity_registry_enabled_default for item in priming)
+
+    speed = next(item for item in priming if item._attribute_key == PRIMFLO_ATTR)
+    assert speed.name == "Pool Pump Priming Speed"
+    assert speed.native_min_value == 600
+    assert speed.native_max_value == 3200
+    assert speed.native_step == 50
+    assert speed.native_unit_of_measurement == "rpm"
+    assert speed.native_value is None
+
+    duration = next(item for item in priming if item._attribute_key == PRIMTIM_ATTR)
+    assert duration.name == "Pool Pump Priming Duration"
+    assert duration.native_min_value == 0
+    assert duration.native_max_value == 10
+    assert duration.native_step == 1
+    assert duration.native_unit_of_measurement == UnitOfTime.MINUTES
+    assert duration.native_value is None
+
+
+async def test_pump_priming_numbers_malformed_values_are_unknown(
+    hass: HomeAssistant,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Malformed priming values and limits do not break platform setup."""
+    pump = PoolObject(
+        "PUMP1",
+        {
+            "OBJTYP": PUMP_TYPE,
+            "SNAME": "Pool Pump",
+            "MIN": "bad",
+            "MAX": "bad",
+            "PRIMFLO": "bad",
+            "PRIMTIM": "bad",
+        },
+    )
+
+    priming = [
+        item
+        for item in _build_entities(mock_coordinator, [pump])
+        if isinstance(item, PumpPrimingNumber)
+    ]
+    speed = next(item for item in priming if item._attribute_key == PRIMFLO_ATTR)
+
+    assert speed.native_min_value == 450
+    assert speed.native_max_value == 3450
+    assert all(item.native_value is None for item in priming)
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    [(PRIMFLO_ATTR, 2500), (PRIMTIM_ATTR, 7)],
+)
+async def test_pump_priming_number_write_path(
+    hass: HomeAssistant,
+    mock_coordinator: MagicMock,
+    attribute: str,
+    value: int,
+) -> None:
+    """Priming controls write integer strings through requestChanges."""
+    pump = PoolObject(
+        "PUMP1",
+        {
+            "OBJTYP": PUMP_TYPE,
+            "SNAME": "Pool Pump",
+            "MIN": "450",
+            "MAX": "3450",
+        },
+    )
+    number = next(
+        item
+        for item in _build_entities(mock_coordinator, [pump])
+        if isinstance(item, PumpPrimingNumber) and item._attribute_key == attribute
+    )
+    number.hass = hass
+
+    await number.async_set_native_value(value)
+    await hass.async_block_till_done()
+
+    mock_coordinator.controller.request_changes.assert_awaited_once_with(
+        "PUMP1", {attribute: str(value)}
+    )

@@ -27,9 +27,12 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from pyintellicenter import (
     BODY_ATTR,
     BODY_TYPE,
+    CIRCUIT_TYPE,
     HEATER_TYPE,
     LISTORD_ATTR,
     STATUS_ATTR,
+    STATUS_OFF,
+    STATUS_ON,
     ICConnectionError,
     ICError,
     ICModelController,
@@ -325,6 +328,25 @@ def safe_int(value: Any) -> int | None:
         return None
 
 
+def protocol_on_off(value: Any) -> bool | None:
+    """Map the protocol's canonical ON/OFF values to a nullable boolean."""
+    if value == STATUS_ON:
+        return True
+    if value == STATUS_OFF:
+        return False
+    return None
+
+
+def is_user_circuit(pool_object: PoolObject) -> bool:
+    """Return whether an object is a user-controllable circuit.
+
+    Freeze-protection pseudo-circuits are diagnostic state objects rather than
+    user circuits. All other CIRCUIT objects are represented by either the
+    switch or light platform and share circuit configuration controls.
+    """
+    return pool_object.objtype == CIRCUIT_TYPE and pool_object.subtype != "FRZ"
+
+
 def _heater_sort_key(heater: PoolObject) -> int:
     """Sort heaters by LISTORD; unparsable or missing values sort last."""
     order = safe_int(heater[LISTORD_ATTR])
@@ -587,7 +609,11 @@ class PoolEntity(CoordinatorEntity[IntelliCenterCoordinator], Entity):
             self._clear_optimistic_state()
             self.async_write_ha_state()
 
-    async def _async_execute_command(self, command: Awaitable[Any]) -> Any:
+    async def _async_execute_command(
+        self,
+        command: Awaitable[Any],
+        translation_key: str | None = None,
+    ) -> Any:
         """Await a controller command, surfacing failures as HomeAssistantError.
 
         pyintellicenter raises ICError subclasses (connection lost, command
@@ -598,6 +624,11 @@ class PoolEntity(CoordinatorEntity[IntelliCenterCoordinator], Entity):
         try:
             return await command
         except (ICError, ValueError) as err:
+            if translation_key is not None:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key=translation_key,
+                ) from err
             raise HomeAssistantError(
                 f"IntelliCenter command for '{self.name}' failed: {err}"
             ) from err
@@ -711,7 +742,7 @@ class OnOffControlMixin(_MixinBase):
             ...
 
     @property
-    def is_on(self) -> bool:
+    def is_on(self) -> bool | None:
         """Return true if the entity is on."""
         # Use optimistic state if set, otherwise use real state
         if self._optimistic_state is not None:

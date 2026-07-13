@@ -59,6 +59,7 @@ from . import (
     body_temperature_limits,
     heaters_for_body,
 )
+from .const import DOMAIN
 from .coordinator import IntelliCenterCoordinator
 
 # IntelliCenter subtype for multi-mode combo heaters (e.g. UltraTemp ETi Hybrid)
@@ -73,6 +74,13 @@ _HCOMBO_MODE_LABELS: dict[HeaterType, str] = {
 }
 _HCOMBO_LABEL_TO_MODE: dict[str, HeaterType] = {
     label: mode for mode, label in _HCOMBO_MODE_LABELS.items()
+}
+_SOLAR_MODE_LABELS: dict[HeaterType, str] = {
+    HeaterType.SOLAR_ONLY: "Solar Only",
+    HeaterType.SOLAR_PREFERRED: "Solar Preferred",
+}
+_SOLAR_LABEL_TO_MODE: dict[str, HeaterType] = {
+    label: mode for mode, label in _SOLAR_MODE_LABELS.items()
 }
 
 _LOGGER = logging.getLogger(__name__)
@@ -169,6 +177,26 @@ class PoolWaterHeater(PoolEntity, WaterHeaterEntity, RestoreEntity):
                 return True
         return False
 
+    @property
+    def _has_solar(self) -> bool:
+        """Return whether a solar heater is configured for this body."""
+        for heater_id in self._heater_list:
+            heater_obj = self.coordinator.model[heater_id]
+            if heater_obj is not None and heater_obj.subtype == "SOLAR":
+                return True
+        return False
+
+    def _current_solar_mode(self) -> HeaterType | None:
+        """Return the active solar mode when supported and valid."""
+        if not self._has_solar:
+            return None
+        mode = self._pool_object[MODE_ATTR]
+        try:
+            heater_type = HeaterType(int(mode))
+        except (ValueError, TypeError):
+            return None
+        return heater_type if heater_type in _SOLAR_MODE_LABELS else None
+
     def _current_hcombo_mode(self) -> HeaterType | None:
         """Return the active HCOMBO HeaterType, or None if off or not applicable."""
         if not self._is_multimode:
@@ -205,10 +233,17 @@ class PoolWaterHeater(PoolEntity, WaterHeaterEntity, RestoreEntity):
         for heater in self._heater_list:
             heater_obj = self.coordinator.model[heater]
             if heater_obj is not None and operation == heater_obj.sname:
-                # Standard heater: assign it. We intentionally do NOT write MODE here
-                # (MODE=OFF would disable heating; the correct MODE depends on the
-                # heater's type and the panel derives it). current_operation prefers an
-                # assigned standard heater over a possibly-stale HCOMBO MODE.
+                # Standard heater: assign it. On solar-capable bodies also write
+                # MODE=HEATER so a previously selected solar mode does not linger
+                # (current_operation gives a valid solar MODE precedence). On
+                # non-solar bodies MODE is left alone: the panel derives it, and
+                # current_operation prefers the assigned standard heater over a
+                # possibly-stale HCOMBO MODE.
+                if self._has_solar:
+                    return {
+                        HEATER_ATTR: heater,
+                        MODE_ATTR: str(HeaterType.HEATER.value),
+                    }
                 return {HEATER_ATTR: heater}
         return None
 
@@ -323,18 +358,27 @@ class PoolWaterHeater(PoolEntity, WaterHeaterEntity, RestoreEntity):
         For multi-mode (HCOMBO) heaters, operation is controlled via MODE_ATTR
         on the body rather than HEATER_ATTR assignment.
         """
-        # An assigned standard (non-HCOMBO) heater takes precedence. This also makes
-        # the state correct when a stale HCOMBO MODE remains after switching to a
-        # standard heater on a mixed body.
+        # A valid solar MODE takes precedence: selecting Solar Only/Preferred
+        # writes MODE and leaves HEATER pointing at the previous heater, so the
+        # heater assignment alone cannot be trusted on solar-capable bodies.
+        # (Hardware: MODE is the panel's authoritative heat-mode plane; a body
+        # heating with a standard heater reports MODE=2/HEATER.)
+        solar_mode = self._current_solar_mode()
+        if solar_mode is not None:
+            return _SOLAR_MODE_LABELS[solar_mode]
+        # Otherwise an assigned standard (non-HCOMBO) heater is the operation.
+        # This also keeps the state correct when a stale HCOMBO MODE remains
+        # after switching to a standard heater on a mixed body.
         heater = self._pool_object[HEATER_ATTR]
-        if heater in self._heater_list:
-            heater_obj = self.coordinator.model[heater]
-            if (
-                heater_obj is not None
-                and heater_obj.sname is not None
-                and heater_obj.subtype != _HCOMBO_SUBTYPE
-            ):
-                return str(heater_obj.sname)
+        heater_obj = (
+            self.coordinator.model[heater] if heater in self._heater_list else None
+        )
+        if (
+            heater_obj is not None
+            and heater_obj.sname is not None
+            and heater_obj.subtype != _HCOMBO_SUBTYPE
+        ):
+            return str(heater_obj.sname)
         if self._is_multimode:
             mode = self._current_hcombo_mode()
             if mode is not None:
@@ -345,6 +389,8 @@ class PoolWaterHeater(PoolEntity, WaterHeaterEntity, RestoreEntity):
     def operation_list(self) -> list[str]:
         """Return the list of available operation modes."""
         operations: list[str] = [str(STATE_OFF)]
+        if self._has_solar:
+            operations.extend(_SOLAR_MODE_LABELS.values())
         if self._is_multimode:
             operations.extend(_HCOMBO_MODE_LABELS.values())
         # Always include standard (non-HCOMBO) heaters — handles pure standard and
@@ -363,24 +409,35 @@ class PoolWaterHeater(PoolEntity, WaterHeaterEntity, RestoreEntity):
 
     async def async_set_operation_mode(self, operation_mode: str) -> None:
         """Set new target operation mode."""
-        changes = self._operation_to_changes(operation_mode)
-        if changes is None:
-            _LOGGER.warning("Unknown operation mode: %s", operation_mode)
+        if operation_mode not in self.operation_list:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="invalid_heat_mode",
+            )
+        await self._async_apply_operation(operation_mode)
+
+    async def _async_apply_operation(self, operation: str) -> None:
+        """Apply a validated operation through its matching control plane."""
+        solar_mode = _SOLAR_LABEL_TO_MODE.get(operation)
+        if self._has_solar and solar_mode is not None:
+            await self._async_execute_command(
+                self._controller.set_heat_mode(self._pool_object.objnam, solar_mode),
+                translation_key="command_failed",
+            )
             return
-        await self._async_execute_command(
-            self._controller.request_changes(self._pool_object.objnam, changes)
-        )
+        changes = self._operation_to_changes(operation)
+        if changes is not None:
+            await self._async_execute_command(
+                self._controller.request_changes(self._pool_object.objnam, changes),
+                translation_key="command_failed",
+            )
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the entity on, restoring the last operation or a safe default."""
         operation = self._last_operation
-        if operation is None or self._operation_to_changes(operation) is None:
+        if operation is None or operation not in self.operation_list:
             operation = self._default_on_operation()
-        changes = self._operation_to_changes(operation)
-        if changes is not None:
-            await self._async_execute_command(
-                self._controller.request_changes(self._pool_object.objnam, changes)
-            )
+        await self._async_apply_operation(operation)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the entity off, clearing both control planes atomically."""

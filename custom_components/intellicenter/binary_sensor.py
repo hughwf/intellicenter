@@ -22,13 +22,17 @@ from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from pyintellicenter import (
+    ACT_ATTR,
     BODY_ATTR,
     BODY_TYPE,
     CHEM_TYPE,
+    CIRCUIT_ATTR,
     CIRCUIT_TYPE,
+    DAY_ATTR,
     HEATER_ATTR,
     HEATER_TYPE,
     HTMODE_ATTR,
+    LOTMP_ATTR,
     ORPHI_ATTR,
     ORPLO_ATTR,
     PHHI_ATTR,
@@ -40,10 +44,20 @@ from pyintellicenter import (
     STATUS_ATTR,
     STATUS_ON,
     SYSTEM_TYPE,
+    TIME_ATTR,
+    TIMOUT_ATTR,
+    UPDATE_ATTR,
+    VACFLO_ATTR,
     PoolObject,
 )
 
-from . import IntelliCenterConfigEntry, PoolEntity, async_setup_pool_entities
+from . import (
+    IntelliCenterConfigEntry,
+    PoolEntity,
+    async_setup_pool_entities,
+    protocol_on_off,
+)
+from .const import CHEM_CONTROLLER_SUBTYPE, DNTSTP_ATTR, SINGLE_ATTR
 from .coordinator import IntelliCenterCoordinator
 from .sensor import normalize_system_mode
 
@@ -52,11 +66,15 @@ _LOGGER = logging.getLogger(__name__)
 # Coordinator handles updates via push, so no parallel update limit needed
 PARALLEL_UPDATES = 0
 
+_CHEM_ALERT_ENTITY_KEY = "CHEM_ALERT"
+
 
 def _build_entities(
     coordinator: IntelliCenterCoordinator, candidates: Iterable[PoolObject]
 ) -> list[
     PoolBinarySensor
+    | ChemAlertBinarySensor
+    | FirmwareUpdateBinarySensor
     | HeaterBinarySensor
     | ScheduleBinarySensor
     | SystemModeBinarySensor
@@ -64,6 +82,8 @@ def _build_entities(
     """Build binary sensor entities for the given candidate pool objects."""
     sensors: list[
         PoolBinarySensor
+        | ChemAlertBinarySensor
+        | FirmwareUpdateBinarySensor
         | HeaterBinarySensor
         | ScheduleBinarySensor
         | SystemModeBinarySensor
@@ -103,7 +123,8 @@ def _build_entities(
                     device_class=BinarySensorDeviceClass.RUNNING,
                 )
             )
-        elif obj.objtype == CHEM_TYPE and obj.subtype == "ICHEM":
+        elif obj.objtype == CHEM_TYPE and obj.subtype == CHEM_CONTROLLER_SUBTYPE:
+            sensors.append(ChemAlertBinarySensor(coordinator, obj))
             # IntelliChem alarm indicators (diagnostic entities)
             if PHHI_ATTR in obj.attribute_keys:
                 sensors.append(
@@ -153,11 +174,13 @@ def _build_entities(
                         entity_category=EntityCategory.DIAGNOSTIC,
                     )
                 )
-        elif obj.objtype == SYSTEM_TYPE and SERVICE_ATTR in obj.attribute_keys:
-            # Panel operating-mode problem indicator: on whenever the panel is
-            # not in normal automatic operation (Service or Time Out), e.g.
-            # left in service mode after maintenance or a power outage.
-            sensors.append(SystemModeBinarySensor(coordinator, obj))
+        elif obj.objtype == SYSTEM_TYPE:
+            sensors.append(FirmwareUpdateBinarySensor(coordinator, obj))
+            if SERVICE_ATTR in obj.attribute_keys:
+                # Panel operating-mode problem indicator: on whenever the panel is
+                # not in normal automatic operation (Service or Time Out), e.g.
+                # left in service mode after maintenance or a power outage.
+                sensors.append(SystemModeBinarySensor(coordinator, obj))
     return sensors
 
 
@@ -210,6 +233,95 @@ class PoolBinarySensor(PoolEntity, BinarySensorEntity):
     def is_on(self) -> bool:
         """Return true if sensor is on."""
         return bool(self._pool_object[self._attribute_key] == self._value_for_on)
+
+
+class ChemAlertBinarySensor(PoolEntity, BinarySensorEntity):
+    """Aggregate IntelliChem alarm state."""
+
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:flask-empty-remove-outline"
+    _alert_attributes = (PHHI_ATTR, PHLO_ATTR, ORPHI_ATTR, ORPLO_ATTR)
+
+    def __init__(
+        self,
+        coordinator: IntelliCenterCoordinator,
+        pool_object: PoolObject,
+    ) -> None:
+        """Initialize the aggregate alert sensor."""
+        super().__init__(
+            coordinator,
+            pool_object,
+            attribute_key=_CHEM_ALERT_ENTITY_KEY,
+            name="+ Chemistry Alert",
+        )
+
+    @property
+    def _input_states(self) -> tuple[bool | None, ...]:
+        """Return the normalized states of every alarm input."""
+        return tuple(
+            protocol_on_off(self._pool_object[attribute])
+            for attribute in self._alert_attributes
+        )
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return whether any chemistry alarm is active."""
+        states = self._input_states
+        if any(state is True for state in states):
+            return True
+        if all(state is False for state in states):
+            return False
+        return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return active alert names alongside the standard metadata."""
+        attributes = super().extra_state_attributes
+        if self.is_on is not None:
+            attributes["active_alerts"] = (
+                self._controller.get_chem_alerts(self._pool_object.objnam)
+                if self._controller.has_chem_alert(self._pool_object.objnam)
+                else []
+            )
+        return attributes
+
+    def isUpdated(self, updates: dict[str, dict[str, Any]]) -> bool:
+        """Return whether any contributing alarm attribute changed."""
+        return self._check_attributes_updated(updates, *self._alert_attributes)
+
+
+class FirmwareUpdateBinarySensor(PoolEntity, BinarySensorEntity):
+    """Report whether the panel advertises an available firmware update."""
+
+    _attr_device_class = BinarySensorDeviceClass.UPDATE
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(
+        self,
+        coordinator: IntelliCenterCoordinator,
+        pool_object: PoolObject,
+    ) -> None:
+        """Initialize the firmware-update availability sensor."""
+        super().__init__(
+            coordinator,
+            pool_object,
+            attribute_key=UPDATE_ATTR,
+            name="Firmware Update Available",
+        )
+
+    @property
+    def is_on(self) -> bool | None:
+        """Map numeric update flags plus canonical protocol ON/OFF values."""
+        value = self._pool_object[self._attribute_key]
+        mapped = protocol_on_off(value)
+        if mapped is not None:
+            return mapped
+        if value == "1":
+            return True
+        if value == "0":
+            return False
+        return None
 
 
 # -------------------------------------------------------------------------------------
@@ -317,8 +429,8 @@ class ScheduleBinarySensor(PoolEntity, BinarySensorEntity):
         super().__init__(
             coordinator,
             pool_object,
-            attribute_key="ACT",
-            extra_state_attributes=["VACFLO"],
+            attribute_key=ACT_ATTR,
+            enabled_by_default=False,
         )
 
     @property
@@ -328,9 +440,61 @@ class ScheduleBinarySensor(PoolEntity, BinarySensorEntity):
         return f"Schedule ({sname})"
 
     @property
-    def is_on(self) -> bool:
+    def is_on(self) -> bool | None:
         """Return true if the schedule is currently active."""
-        return bool(self._pool_object[self._attribute_key] == STATUS_ON)
+        return protocol_on_off(self._pool_object[self._attribute_key])
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return schedule configuration details when available."""
+        attributes = super().extra_state_attributes
+        objnam = self._pool_object.objnam
+
+        circuit = self._controller.get_schedule_circuit(objnam)
+        if circuit is not None:
+            attributes[CIRCUIT_ATTR] = circuit
+            circuit_object = self.coordinator.model[circuit]
+            if circuit_object is not None and circuit_object.sname is not None:
+                attributes["CIRCUIT_NAME"] = circuit_object.sname
+
+        helper_values = {
+            DAY_ATTR: self._controller.get_schedule_days(objnam),
+            TIME_ATTR: self._controller.get_schedule_start_time(objnam),
+            TIMOUT_ATTR: self._controller.get_schedule_stop_time(objnam),
+        }
+        for key, value in helper_values.items():
+            if value is not None:
+                attributes[key] = value
+
+        for key in (
+            HEATER_ATTR,
+            LOTMP_ATTR,
+            SINGLE_ATTR,
+            DNTSTP_ATTR,
+            VACFLO_ATTR,
+        ):
+            value = self._pool_object[key]
+            if value is not None:
+                attributes[key] = value
+
+        return attributes
+
+    def isUpdated(self, updates: dict[str, dict[str, Any]]) -> bool:
+        """Return true when running state or schedule details change."""
+        return self._check_attributes_updated(
+            updates,
+            ACT_ATTR,
+            CIRCUIT_ATTR,
+            DAY_ATTR,
+            TIME_ATTR,
+            TIMOUT_ATTR,
+            HEATER_ATTR,
+            LOTMP_ATTR,
+            SINGLE_ATTR,
+            DNTSTP_ATTR,
+            STATUS_ATTR,
+            VACFLO_ATTR,
+        )
 
 
 # -------------------------------------------------------------------------------------

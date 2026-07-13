@@ -18,10 +18,12 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from pyintellicenter import (
     BODY_TYPE,
     CHEM_TYPE,
-    CIRCUIT_TYPE,
     HEATER_ATTR,
     HTMODE_ATTR,
+    SCHED_TYPE,
     STATUS_ATTR,
+    STATUS_OFF,
+    STATUS_ON,
     SUPER_ATTR,
     SYSTEM_TYPE,
     VACFLO_ATTR,
@@ -34,7 +36,10 @@ from . import (
     OnOffControlMixin,
     PoolEntity,
     async_setup_pool_entities,
+    is_user_circuit,
+    protocol_on_off,
 )
+from .const import CHLORINATOR_SUBTYPE, DNTSTP_ATTR, MANHT_ATTR
 from .coordinator import IntelliCenterCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -53,7 +58,7 @@ def _build_entities(
             switches.append(PoolBody(coordinator, pool_obj))
         elif (
             pool_obj.objtype == CHEM_TYPE
-            and pool_obj.subtype == "ICHLOR"
+            and pool_obj.subtype == CHLORINATOR_SUBTYPE
             and SUPER_ATTR in pool_obj.attribute_keys
         ):
             switches.append(
@@ -65,21 +70,38 @@ def _build_entities(
                     icon="mdi:alpha-s-box-outline",
                 )
             )
-        elif (
-            pool_obj.objtype == CIRCUIT_TYPE
-            and not (pool_obj.is_a_light or pool_obj.is_a_light_show)
-            and pool_obj.is_featured
-        ):
+        elif is_user_circuit(pool_obj):
+            if not (pool_obj.is_a_light or pool_obj.is_a_light_show):
+                is_group = pool_obj.subtype == "CIRCGRP"
+                switches.append(
+                    PoolCircuit(
+                        coordinator,
+                        pool_obj,
+                        icon=(
+                            "mdi:alpha-g-box-outline"
+                            if is_group
+                            else "mdi:alpha-f-box-outline"
+                        ),
+                        enabled_by_default=pool_obj.is_featured or is_group,
+                    )
+                )
             switches.append(
-                PoolCircuit(coordinator, pool_obj, icon="mdi:alpha-f-box-outline")
+                PoolCircuit(
+                    coordinator,
+                    pool_obj,
+                    attribute_key=DNTSTP_ATTR,
+                    name="+ Don't Stop",
+                    icon="mdi:timer-off-outline",
+                    enabled_by_default=False,
+                    entity_category=EntityCategory.CONFIG,
+                )
             )
-        elif pool_obj.objtype == CIRCUIT_TYPE and pool_obj.subtype == "CIRCGRP":
-            switches.append(
-                PoolCircuit(coordinator, pool_obj, icon="mdi:alpha-g-box-outline")
-            )
+        elif pool_obj.objtype == SCHED_TYPE:
+            switches.append(PoolSchedule(coordinator, pool_obj))
         elif pool_obj.objtype == SYSTEM_TYPE:
             # Vacation mode uses convenience method
             switches.append(PoolVacation(coordinator, pool_obj))
+            switches.append(ManualHeatSwitch(coordinator, pool_obj))
     return switches
 
 
@@ -109,6 +131,7 @@ class PoolCircuit(PoolEntity, OnOffControlMixin, SwitchEntity):
         name: str | None = None,
         icon: str | None = None,
         enabled_by_default: bool = True,
+        entity_category: EntityCategory | None = None,
     ) -> None:
         """Initialize a pool circuit switch."""
         super().__init__(
@@ -119,6 +142,43 @@ class PoolCircuit(PoolEntity, OnOffControlMixin, SwitchEntity):
             icon=icon,
             enabled_by_default=enabled_by_default,
         )
+        if entity_category is not None:
+            self._attr_entity_category = entity_category
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return circuit state, or unknown for missing/malformed values."""
+        if self._optimistic_state is not None:
+            return self._optimistic_state
+        return protocol_on_off(self._pool_object[self._attribute_key])
+
+
+class PoolSchedule(PoolCircuit):
+    """Representation of a schedule's enabled state."""
+
+    _attr_icon = "mdi:calendar-check"
+
+    def __init__(
+        self,
+        coordinator: IntelliCenterCoordinator,
+        pool_object: PoolObject,
+    ) -> None:
+        """Initialize a schedule enable switch."""
+        super().__init__(coordinator, pool_object, enabled_by_default=False)
+
+    @property
+    def name(self) -> str:
+        """Return the schedule display name."""
+        return f"Schedule ({self._pool_object.sname or 'Unknown'})"
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return whether the schedule is enabled."""
+        if self._optimistic_state is not None:
+            return self._optimistic_state
+        if protocol_on_off(self._pool_object[STATUS_ATTR]) is None:
+            return None
+        return bool(self._controller.is_schedule_enabled(self._pool_object.objnam))
 
 
 class PoolBody(PoolCircuit):
@@ -134,6 +194,49 @@ class PoolBody(PoolCircuit):
         """Initialize a Pool body from the underlying circuit."""
         super().__init__(coordinator, pool_object)
         self._extra_state_attrs = {VOL_ATTR, HEATER_ATTR, HTMODE_ATTR}
+
+
+class ManualHeatSwitch(PoolEntity, SwitchEntity):
+    """Spa Manual Heat configuration switch."""
+
+    _attr_device_class = SwitchDeviceClass.SWITCH
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_icon = "mdi:heat-wave"
+
+    def __init__(
+        self,
+        coordinator: IntelliCenterCoordinator,
+        pool_object: PoolObject,
+    ) -> None:
+        """Initialize Spa Manual Heat."""
+        super().__init__(
+            coordinator,
+            pool_object,
+            attribute_key=MANHT_ATTR,
+            name="Spa Manual Heat",
+        )
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return the configured state, or unknown if it has not synchronized."""
+        return protocol_on_off(self._pool_object[self._attribute_key])
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Enable Spa Manual Heat."""
+        await self._async_set_manual_heat(STATUS_ON)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Disable Spa Manual Heat."""
+        await self._async_set_manual_heat(STATUS_OFF)
+
+    async def _async_set_manual_heat(self, value: str) -> None:
+        """Write MANHT and translate protocol failures."""
+        await self._async_execute_command(
+            self._controller.request_changes(
+                self._pool_object.objnam, {MANHT_ATTR: value}
+            ),
+            translation_key="command_failed",
+        )
 
 
 class PoolVacation(PoolEntity, SwitchEntity):

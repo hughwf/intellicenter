@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 import logging
+import math
 from typing import Any
 
 from homeassistant.components.number import (
@@ -25,6 +26,7 @@ from homeassistant.const import (
     CONCENTRATION_PARTS_PER_MILLION,
     PERCENTAGE,
     EntityCategory,
+    UnitOfTime,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
@@ -48,9 +50,12 @@ from pyintellicenter import (
     PHSET_ATTR,
     PMPCIRC_TYPE,
     PRIM_ATTR,
+    PUMP_TYPE,
     SEC_ATTR,
     SELECT_ATTR,
     SPEED_ATTR,
+    TIME_ATTR,
+    TIMOUT_ATTR,
     PoolObject,
 )
 
@@ -59,9 +64,18 @@ from . import (
     PoolEntity,
     async_setup_pool_entities,
     body_temperature_limits,
+    is_user_circuit,
     safe_int,
 )
-from .const import CONST_GPM, CONST_RPM
+from .const import (
+    CHEM_CONTROLLER_SUBTYPE,
+    CHLORINATOR_SUBTYPE,
+    CONST_GPM,
+    CONST_RPM,
+    DOMAIN,
+    PRIMFLO_ATTR,
+    PRIMTIM_ATTR,
+)
 from .coordinator import IntelliCenterCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -103,22 +117,56 @@ PUMP_RPM_STEP = 50
 PUMP_GPM_MIN_DEFAULT = 15
 PUMP_GPM_MAX_DEFAULT = 140
 PUMP_GPM_STEP = 5
+PUMP_PRIMING_DURATION_MIN = 0
+PUMP_PRIMING_DURATION_MAX = 10
+
+EGG_TIMER_MIN = 1
+EGG_TIMER_MAX = 720
+EGG_TIMER_STEP = 1
+
+SUPERCHLOR_DURATION_MIN = 1
+SUPERCHLOR_DURATION_MAX = 96
+SUPERCHLOR_DURATION_STEP = 1
+SECONDS_PER_HOUR = 3600
 
 # -------------------------------------------------------------------------------------
 
 
 def _build_entities(
     coordinator: IntelliCenterCoordinator, candidates: Iterable[PoolObject]
-) -> list[PoolNumber | PumpSpeedNumber]:
+) -> list[PoolNumber | PumpPrimingNumber | PumpSpeedNumber]:
     """Build number entities for the given candidate pool objects."""
     # Materialize so the candidate objects can be iterated more than once below.
     candidate_objects = list(candidates)
 
-    numbers: list[PoolNumber | PumpSpeedNumber] = []
+    numbers: list[PoolNumber | PumpPrimingNumber | PumpSpeedNumber] = []
 
     for pool_obj in candidate_objects:
-        if pool_obj.objtype == CHEM_TYPE:
-            if pool_obj.subtype == "ICHLOR" and PRIM_ATTR in pool_obj.attribute_keys:
+        if is_user_circuit(pool_obj):
+            numbers.append(
+                PoolNumber(
+                    coordinator,
+                    pool_obj,
+                    min_value=EGG_TIMER_MIN,
+                    max_value=EGG_TIMER_MAX,
+                    step=EGG_TIMER_STEP,
+                    attribute_key=TIME_ATTR,
+                    name="+ Egg Timer",
+                    icon="mdi:timer-outline",
+                    unit_of_measurement=UnitOfTime.MINUTES,
+                    mode=NumberMode.BOX,
+                    entity_category=EntityCategory.CONFIG,
+                    integer_only=True,
+                    enabled_by_default=False,
+                )
+            )
+        elif pool_obj.objtype == CHEM_TYPE:
+            if pool_obj.subtype == CHLORINATOR_SUBTYPE:
+                numbers.append(SuperChlorinateDurationNumber(coordinator, pool_obj))
+            if (
+                pool_obj.subtype == CHLORINATOR_SUBTYPE
+                and PRIM_ATTR in pool_obj.attribute_keys
+            ):
                 # IntelliChlor output percentage controls (CONFIG category)
                 body_attr = pool_obj[BODY_ATTR]
                 if body_attr is None:
@@ -143,7 +191,7 @@ def _build_entities(
                             )
                         )
 
-            elif pool_obj.subtype == "ICHEM":
+            elif pool_obj.subtype == CHEM_CONTROLLER_SUBTYPE:
                 # IntelliChem pH setpoint control (CONFIG category)
                 if PHSET_ATTR in pool_obj.attribute_keys:
                     numbers.append(
@@ -259,6 +307,51 @@ def _build_entities(
                     integer_only=True,
                 )
             )
+
+    for pool_obj in candidate_objects:
+        if pool_obj.objtype != PUMP_TYPE:
+            continue
+
+        rpm_min = safe_int(pool_obj[MIN_ATTR])
+        rpm_max = safe_int(pool_obj[MAX_ATTR])
+        if rpm_min is None or rpm_max is None or rpm_min <= 0 or rpm_max <= rpm_min:
+            rpm_min = PUMP_RPM_MIN_DEFAULT
+            rpm_max = PUMP_RPM_MAX_DEFAULT
+
+        numbers.extend(
+            (
+                PumpPrimingNumber(
+                    coordinator,
+                    pool_obj,
+                    min_value=rpm_min,
+                    max_value=rpm_max,
+                    step=PUMP_RPM_STEP,
+                    attribute_key=PRIMFLO_ATTR,
+                    name="+ Priming Speed",
+                    icon="mdi:speedometer",
+                    unit_of_measurement=CONST_RPM,
+                    mode=NumberMode.BOX,
+                    entity_category=EntityCategory.CONFIG,
+                    enabled_by_default=False,
+                    integer_only=True,
+                ),
+                PumpPrimingNumber(
+                    coordinator,
+                    pool_obj,
+                    min_value=PUMP_PRIMING_DURATION_MIN,
+                    max_value=PUMP_PRIMING_DURATION_MAX,
+                    step=1,
+                    attribute_key=PRIMTIM_ATTR,
+                    name="+ Priming Duration",
+                    icon="mdi:timer-cog-outline",
+                    unit_of_measurement=UnitOfTime.MINUTES,
+                    mode=NumberMode.BOX,
+                    entity_category=EntityCategory.CONFIG,
+                    enabled_by_default=False,
+                    integer_only=True,
+                ),
+            )
+        )
 
     # Add pump circuit speed/flow setpoints (PMPCIRC) - CONFIG category
     # These allow control of variable speed pump settings per circuit
@@ -510,7 +603,70 @@ class PoolNumber(PoolEntity, NumberEntity):
             self.request_changes({self._attribute_key: str(int(value))})
 
 
+class SuperChlorinateDurationNumber(PoolNumber):
+    """IntelliChlor superchlorinate duration exposed in hours."""
+
+    def __init__(
+        self,
+        coordinator: IntelliCenterCoordinator,
+        pool_object: PoolObject,
+    ) -> None:
+        """Initialize the duration number."""
+        super().__init__(
+            coordinator,
+            pool_object,
+            min_value=SUPERCHLOR_DURATION_MIN,
+            max_value=SUPERCHLOR_DURATION_MAX,
+            step=SUPERCHLOR_DURATION_STEP,
+            attribute_key=TIMOUT_ATTR,
+            name="+ Superchlorinate Duration",
+            icon="mdi:timer-cog-outline",
+            unit_of_measurement=UnitOfTime.HOURS,
+            mode=NumberMode.BOX,
+            entity_category=EntityCategory.CONFIG,
+            integer_only=False,
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        """Return protocol seconds converted to hours."""
+        seconds = self._safe_float_conversion(self._pool_object[self._attribute_key])
+        if seconds is None or not math.isfinite(seconds):
+            return None
+        hours = seconds / SECONDS_PER_HOUR
+        if (
+            hours < SUPERCHLOR_DURATION_MIN
+            or hours > SUPERCHLOR_DURATION_MAX
+            or not hours.is_integer()
+        ):
+            return None
+        return hours
+
+    async def async_set_native_value(self, value: float) -> None:
+        """Write whole hours as protocol seconds."""
+        if (
+            value < SUPERCHLOR_DURATION_MIN
+            or value > SUPERCHLOR_DURATION_MAX
+            or not float(value).is_integer()
+        ):
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="invalid_superchlorinate_duration",
+            )
+        await self._async_execute_command(
+            self._controller.request_changes(
+                self._pool_object.objnam,
+                {TIMOUT_ATTR: str(int(value * SECONDS_PER_HOUR))},
+            ),
+            translation_key="command_failed",
+        )
+
+
 # -------------------------------------------------------------------------------------
+
+
+class PumpPrimingNumber(PoolNumber):
+    """Disabled-by-default pump priming configuration control."""
 
 
 class PumpSpeedNumber(PoolEntity, NumberEntity):

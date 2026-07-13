@@ -377,7 +377,7 @@ async def test_water_heater_turn_on(
 
     # No remembered operation -> default is the first standard heater (Gas Heater).
     mock_coordinator.controller.request_changes.assert_called_once_with(
-        "POOL1", {HEATER_ATTR: "HTR01"}
+        "POOL1", {HEATER_ATTR: "HTR01", MODE_ATTR: "2"}
     )
 
 
@@ -429,7 +429,7 @@ async def test_water_heater_turn_on_remembers_last_heater(
 
     # Restores the remembered Solar Heater operation.
     mock_coordinator.controller.request_changes.assert_called_once_with(
-        "POOL1", {HEATER_ATTR: "HTR02"}
+        "POOL1", {HEATER_ATTR: "HTR02", MODE_ATTR: "2"}
     )
 
 
@@ -480,6 +480,130 @@ async def test_water_heater_operation_list(
     assert STATE_OFF in operations
     assert "Gas Heater" in operations
     assert "Solar Heater" in operations
+    assert "Solar Only" in operations
+    assert "Solar Preferred" in operations
+
+
+async def test_water_heater_solar_modes_absent_without_solar_heater(
+    hass: HomeAssistant,
+    pool_object_body_with_heater: PoolObject,
+    pool_object_heater: PoolObject,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Plain-heater bodies do not advertise solar capabilities."""
+    mock_coordinator.model.__getitem__ = MagicMock(return_value=pool_object_heater)
+    water_heater = PoolWaterHeater(
+        mock_coordinator, pool_object_body_with_heater, ["HTR01"]
+    )
+
+    assert "Solar Only" not in water_heater.operation_list
+    assert "Solar Preferred" not in water_heater.operation_list
+
+
+@pytest.mark.parametrize(
+    ("label", "mode"),
+    [
+        ("Solar Only", HeaterType.SOLAR_ONLY),
+        ("Solar Preferred", HeaterType.SOLAR_PREFERRED),
+    ],
+)
+async def test_water_heater_set_solar_operation_uses_helper(
+    hass: HomeAssistant,
+    pool_object_body_with_heater: PoolObject,
+    pool_object_heater: PoolObject,
+    pool_object_heater2: PoolObject,
+    mock_coordinator: MagicMock,
+    label: str,
+    mode: HeaterType,
+) -> None:
+    """Solar modes use the typed body heat-mode helper."""
+    lookup = {"HTR01": pool_object_heater, "HTR02": pool_object_heater2}
+    mock_coordinator.model = MagicMock()
+    mock_coordinator.model.__getitem__ = MagicMock(side_effect=lookup.get)
+    water_heater = PoolWaterHeater(
+        mock_coordinator, pool_object_body_with_heater, ["HTR01", "HTR02"]
+    )
+
+    await water_heater.async_set_operation_mode(label)
+
+    mock_coordinator.controller.set_heat_mode.assert_awaited_once_with("POOL1", mode)
+    mock_coordinator.controller.request_changes.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("raw_mode", "expected"),
+    [("3", "Solar Only"), ("4", "Solar Preferred")],
+)
+async def test_water_heater_current_solar_operation(
+    hass: HomeAssistant,
+    pool_object_heater2: PoolObject,
+    mock_coordinator: MagicMock,
+    raw_mode: str,
+    expected: str,
+) -> None:
+    """A configured solar body's MODE is mapped to the matching operation label."""
+    mock_coordinator.model = MagicMock()
+    mock_coordinator.model.__getitem__ = MagicMock(return_value=pool_object_heater2)
+    body = PoolObject(
+        "POOL1",
+        {
+            "OBJTYP": BODY_TYPE,
+            "SNAME": "Pool",
+            "STATUS": "ON",
+            "HEATER": "HTR02",
+            "MODE": raw_mode,
+            "LOTMP": "72",
+            "LSTTMP": "68",
+        },
+    )
+
+    water_heater = PoolWaterHeater(mock_coordinator, body, ["HTR02"])
+
+    assert water_heater.current_operation == expected
+
+
+async def test_water_heater_solar_mode_error_is_translated(
+    hass: HomeAssistant,
+    pool_object_body_with_heater: PoolObject,
+    pool_object_heater2: PoolObject,
+    mock_coordinator: MagicMock,
+) -> None:
+    """A failed solar mode write surfaces a translated service error."""
+    from pyintellicenter import ICConnectionError
+
+    mock_coordinator.model = MagicMock()
+    mock_coordinator.model.__getitem__ = MagicMock(return_value=pool_object_heater2)
+    mock_coordinator.controller.set_heat_mode.side_effect = ICConnectionError("offline")
+    water_heater = PoolWaterHeater(
+        mock_coordinator, pool_object_body_with_heater, ["HTR02"]
+    )
+
+    with pytest.raises(HomeAssistantError) as err:
+        await water_heater.async_set_operation_mode("Solar Only")
+
+    assert err.value.translation_domain == "intellicenter"
+    assert err.value.translation_key == "command_failed"
+
+
+async def test_water_heater_refuses_unavailable_solar_mode(
+    hass: HomeAssistant,
+    pool_object_body_with_heater: PoolObject,
+    pool_object_heater: PoolObject,
+    mock_coordinator: MagicMock,
+) -> None:
+    """A solar label is rejected when no solar heater serves the body."""
+    mock_coordinator.model = MagicMock()
+    mock_coordinator.model.__getitem__ = MagicMock(return_value=pool_object_heater)
+    water_heater = PoolWaterHeater(
+        mock_coordinator, pool_object_body_with_heater, ["HTR01"]
+    )
+
+    with pytest.raises(HomeAssistantError) as err:
+        await water_heater.async_set_operation_mode("Solar Only")
+
+    assert err.value.translation_domain == "intellicenter"
+    assert err.value.translation_key == "invalid_heat_mode"
+    mock_coordinator.controller.set_heat_mode.assert_not_called()
 
 
 async def test_water_heater_set_operation_mode(
@@ -1827,3 +1951,66 @@ async def test_water_heater_set_operation_mode_connection_error(
 
     with pytest.raises(HomeAssistantError):
         await water_heater.async_set_operation_mode("Gas Heater")
+
+
+async def test_water_heater_solar_mode_wins_over_assigned_gas_heater(
+    hass: HomeAssistant,
+    pool_object_heater: PoolObject,
+    pool_object_heater2: PoolObject,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Selecting solar leaves HEATER on the gas heater; MODE must win."""
+    lookup = {"HTR01": pool_object_heater, "HTR02": pool_object_heater2}
+    mock_coordinator.model = MagicMock()
+    mock_coordinator.model.__getitem__ = MagicMock(side_effect=lookup.get)
+    body = PoolObject(
+        "POOL1",
+        {
+            "OBJTYP": BODY_TYPE,
+            "SNAME": "Pool",
+            "STATUS": "ON",
+            "HEATER": "HTR01",  # stale gas assignment
+            "MODE": "3",  # Solar Only
+            "LOTMP": "72",
+            "LSTTMP": "68",
+        },
+    )
+
+    water_heater = PoolWaterHeater(mock_coordinator, body, ["HTR01", "HTR02"])
+
+    assert water_heater.current_operation == "Solar Only"
+    # turn-on restoration remembers the solar mode, not the gas heater
+    assert water_heater._last_operation == "Solar Only"
+
+
+async def test_water_heater_gas_selection_clears_solar_mode(
+    hass: HomeAssistant,
+    pool_object_heater: PoolObject,
+    pool_object_heater2: PoolObject,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Selecting a standard heater on a solar body also resets MODE to HEATER."""
+    lookup = {"HTR01": pool_object_heater, "HTR02": pool_object_heater2}
+    mock_coordinator.model = MagicMock()
+    mock_coordinator.model.__getitem__ = MagicMock(side_effect=lookup.get)
+    body = PoolObject(
+        "POOL1",
+        {
+            "OBJTYP": BODY_TYPE,
+            "SNAME": "Pool",
+            "STATUS": "ON",
+            "HEATER": "00000",
+            "MODE": "3",  # currently Solar Only
+            "LOTMP": "72",
+            "LSTTMP": "68",
+        },
+    )
+
+    water_heater = PoolWaterHeater(mock_coordinator, body, ["HTR01", "HTR02"])
+    water_heater.hass = hass
+
+    await water_heater.async_set_operation_mode("Gas Heater")
+
+    mock_coordinator.controller.request_changes.assert_awaited_once_with(
+        "POOL1", {HEATER_ATTR: "HTR01", MODE_ATTR: "2"}
+    )

@@ -16,6 +16,8 @@ from pyintellicenter import (
     PUMP_TYPE,
     SCHED_TYPE,
     SENSE_TYPE,
+    STATUS_OFF,
+    STATUS_ON,
     SYSTEM_TYPE,
     ICModelController,
     ICSystemInfo,
@@ -28,6 +30,13 @@ from custom_components.intellicenter.coordinator import (
     DEFAULT_ATTRIBUTES_MAP,
     IntelliCenterCoordinator,
 )
+
+ON_OFF_UNKNOWN_CASES = [
+    (STATUS_ON, True),
+    (STATUS_OFF, False),
+    (None, None),
+    ("GARBAGE", None),
+]
 
 # Enable custom integrations
 pytest_plugins = "pytest_homeassistant_custom_component"
@@ -166,9 +175,11 @@ def pool_model_data() -> list[dict[str, Any]]:
                 "SNAME": "Pool Cleaner",
                 "STATUS": "OFF",
                 "FEATR": "ON",
+                "TIME": "120",
+                "DNTSTP": "OFF",
             },
         },
-        # Non-featured circuit (should not create switch)
+        # Non-featured circuit (switch is opt-in)
         {
             "objnam": "CIRC02",
             "params": {
@@ -177,6 +188,8 @@ def pool_model_data() -> list[dict[str, Any]]:
                 "SNAME": "Aux Circuit",
                 "STATUS": "OFF",
                 "FEATR": "OFF",
+                "TIME": "60",
+                "DNTSTP": "ON",
             },
         },
         # Pump (variable speed/flow with limits)
@@ -251,7 +264,15 @@ def pool_model_data() -> list[dict[str, Any]]:
                 "OBJTYP": SCHED_TYPE,
                 "SNAME": "Morning Filter",
                 "STATUS": "OFF",
-                "ENABLE": "ON",
+                "ACT": "OFF",
+                "CIRCUIT": "CIRC01",
+                "DAY": "MTWRF",
+                "TIME": "08:00",
+                "TIMOUT": "10:00",
+                "HEATER": "HTR01",
+                "LOTMP": "82",
+                "SINGLE": "OFF",
+                "DNTSTP": "ON",
             },
         },
     ]
@@ -421,6 +442,11 @@ def mock_coordinator(
         return_value={"primary": 50, "secondary": 50}
     )
     mock_controller.is_vacation_mode = MagicMock(return_value=False)
+    mock_controller.is_schedule_enabled = MagicMock(return_value=False)
+    mock_controller.get_schedule_circuit = MagicMock(return_value=None)
+    mock_controller.get_schedule_days = MagicMock(return_value=None)
+    mock_controller.get_schedule_start_time = MagicMock(return_value=None)
+    mock_controller.get_schedule_stop_time = MagicMock(return_value=None)
     # Convenience methods from pyintellicenter v0.1.3
     mock_controller.set_alkalinity = AsyncMock()
     mock_controller.set_calcium_hardness = AsyncMock()
@@ -428,8 +454,13 @@ def mock_coordinator(
     mock_controller.get_alkalinity = MagicMock(return_value=100)
     mock_controller.get_calcium_hardness = MagicMock(return_value=300)
     mock_controller.get_cyanuric_acid = MagicMock(return_value=40)
+    mock_controller.get_saturation_index = MagicMock(return_value=None)
+    mock_controller.get_chem_alerts = MagicMock(return_value=[])
+    mock_controller.has_chem_alert = MagicMock(return_value=False)
     # Pump circuit speed helper - default to None, tests can override return_value
     mock_controller.get_pump_circuit_speed = MagicMock(return_value=None)
+    mock_controller.get_sensor_probe_reading = MagicMock(return_value=None)
+    mock_controller.get_sensor_calibration = MagicMock(return_value=None)
     # Cooling support detection - default to False (no cooling support)
     mock_controller.body_supports_cooling = MagicMock(return_value=False)
     # Heating/cooling setpoint methods

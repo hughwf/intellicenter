@@ -29,6 +29,7 @@ from pyintellicenter import (
     CIRCUIT_TYPE,
     COOL_ATTR,
     CYACID_ATTR,
+    DAY_ATTR,
     EXTINSTR_TYPE,
     FEATR_ATTR,
     FREEZE_ATTR,
@@ -45,6 +46,7 @@ from pyintellicenter import (
     MIN_ATTR,
     MINF_ATTR,
     MODE_ATTR,
+    MODULE_TYPE,
     NORMAL_ATTR,
     ORPHI_ATTR,
     ORPLO_ATTR,
@@ -72,6 +74,7 @@ from pyintellicenter import (
     SELECT_ATTR,
     SENSE_TYPE,
     SERVICE_ATTR,
+    SINDEX_ATTR,
     SNAME_ATTR,
     SOURCE_ATTR,
     SPEED_ATTR,
@@ -79,7 +82,10 @@ from pyintellicenter import (
     SUBTYP_ATTR,
     SUPER_ATTR,
     SYSTEM_TYPE,
+    TEMP_ATTR,
     TIME_ATTR,
+    TIMOUT_ATTR,
+    UPDATE_ATTR,
     USE_ATTR,
     VACFLO_ATTR,
     VER_ATTR,
@@ -92,7 +98,20 @@ from pyintellicenter import (
     PoolObject,
 )
 
-from .const import DEFAULT_TRANSPORT, DOMAIN, TransportType
+from .const import (
+    CALIB_ATTR,
+    DEFAULT_TRANSPORT,
+    DNTSTP_ATTR,
+    DOMAIN,
+    LIMIT_ATTR,
+    MANHT_ATTR,
+    PORT_ATTR,
+    PRIMFLO_ATTR,
+    PRIMTIM_ATTR,
+    PROBE_ATTR,
+    SINGLE_ATTR,
+    TransportType,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -112,6 +131,7 @@ DEFAULT_ATTRIBUTES_MAP: dict[str, set[str]] = {
         LSTTMP_ATTR,
         MODE_ATTR,  # Heat mode (used by multi-mode heaters like HCOMBO)
         STATUS_ATTR,
+        TEMP_ATTR,
         VOL_ATTR,
     },
     CIRCUIT_TYPE: {
@@ -120,7 +140,9 @@ DEFAULT_ATTRIBUTES_MAP: dict[str, set[str]] = {
         USE_ATTR,
         SUBTYP_ATTR,
         FEATR_ATTR,
+        LIMIT_ATTR,
         TIME_ATTR,  # Egg timer duration
+        DNTSTP_ATTR,
         FREEZE_ATTR,  # Freeze protection status
     },
     CIRCGRP_TYPE: {SNAME_ATTR, STATUS_ATTR, USE_ATTR, CIRCUIT_ATTR},  # Circuit groups
@@ -147,6 +169,7 @@ DEFAULT_ATTRIBUTES_MAP: dict[str, set[str]] = {
         ALK_ATTR,
         CALC_ATTR,
         CYACID_ATTR,
+        SINDEX_ATTR,
         # IntelliChem alarm indicators (diagnostic)
         PHHI_ATTR,
         PHLO_ATTR,
@@ -154,6 +177,7 @@ DEFAULT_ATTRIBUTES_MAP: dict[str, set[str]] = {
         ORPLO_ATTR,
         # IntelliChlor sensors
         SALT_ATTR,
+        TIMOUT_ATTR,
     },
     # External instruments (pool covers). Without this entry PoolModel drops the
     # objects entirely and the cover platform never sees them (the model only
@@ -175,6 +199,8 @@ DEFAULT_ATTRIBUTES_MAP: dict[str, set[str]] = {
         PWR_ATTR,
         RPM_ATTR,
         GPM_ATTR,
+        PRIMFLO_ATTR,
+        PRIMTIM_ATTR,
         # Pump operational limits (diagnostic)
         MAX_ATTR,
         MIN_ATTR,
@@ -190,10 +216,32 @@ DEFAULT_ATTRIBUTES_MAP: dict[str, set[str]] = {
         SPEED_ATTR,  # RPM setpoint when SELECT=RPM
         GPM_ATTR,  # GPM setpoint when SELECT=GPM
     },
-    SENSE_TYPE: {SNAME_ATTR, SOURCE_ATTR},
-    SCHED_TYPE: {SNAME_ATTR, ACT_ATTR, VACFLO_ATTR},
-    # MODE/VACFLO/VER plus SERVICE for the system operating mode sensor
-    SYSTEM_TYPE: {MODE_ATTR, SERVICE_ATTR, VACFLO_ATTR, VER_ATTR},
+    SENSE_TYPE: {SNAME_ATTR, SOURCE_ATTR, PROBE_ATTR, CALIB_ATTR},
+    SCHED_TYPE: {
+        SNAME_ATTR,
+        STATUS_ATTR,
+        ACT_ATTR,
+        CIRCUIT_ATTR,
+        DAY_ATTR,
+        TIME_ATTR,
+        TIMOUT_ATTR,
+        HEATER_ATTR,
+        LOTMP_ATTR,
+        SINGLE_ATTR,
+        DNTSTP_ATTR,
+        VACFLO_ATTR,
+    },
+    # System unit/mode, vacation, firmware/update, manual-heat, plus SERVICE for
+    # the system operating mode sensor
+    SYSTEM_TYPE: {
+        MANHT_ATTR,
+        MODE_ATTR,
+        SERVICE_ATTR,
+        UPDATE_ATTR,
+        VACFLO_ATTR,
+        VER_ATTR,
+    },
+    MODULE_TYPE: {SNAME_ATTR, SUBTYP_ATTR, VER_ATTR, PORT_ATTR},
 }
 
 

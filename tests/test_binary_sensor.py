@@ -7,26 +7,96 @@ from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from pyintellicenter import (
     BODY_TYPE,
+    CHEM_TYPE,
     CIRCUIT_TYPE,
     HEATER_ATTR,
     HEATER_TYPE,
     HTMODE_ATTR,
+    ORPHI_ATTR,
+    ORPLO_ATTR,
+    PHHI_ATTR,
+    PHLO_ATTR,
     PUMP_TYPE,
+    SCHED_TYPE,
     STATUS_ATTR,
+    STATUS_ON,
     SYSTEM_TYPE,
+    UPDATE_ATTR,
     PoolModel,
     PoolObject,
 )
 import pytest
 
 from custom_components.intellicenter.binary_sensor import (
+    ChemAlertBinarySensor,
+    FirmwareUpdateBinarySensor,
     HeaterBinarySensor,
     PoolBinarySensor,
+    ScheduleBinarySensor,
     SystemModeBinarySensor,
     _build_entities,
 )
+from custom_components.intellicenter.const import DNTSTP_ATTR, SINGLE_ATTR
+from custom_components.intellicenter.coordinator import DEFAULT_ATTRIBUTES_MAP
+
+from tests.conftest import ON_OFF_UNKNOWN_CASES
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_schedule_attributes_are_tracked() -> None:
+    """PoolModel retains every schedule attribute exposed by its entities."""
+    assert {
+        "STATUS",
+        "ACT",
+        "CIRCUIT",
+        "DAY",
+        "TIME",
+        "TIMOUT",
+        "HEATER",
+        "LOTMP",
+        SINGLE_ATTR,
+        DNTSTP_ATTR,
+        "VACFLO",
+    } <= DEFAULT_ATTRIBUTES_MAP[SCHED_TYPE]
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        ("1", True),
+        ("0", False),
+        ("ON", True),
+        ("OFF", False),
+        (None, None),
+        ("BROKEN", None),
+    ],
+)
+async def test_firmware_update_sensor_state_mapping(
+    hass: HomeAssistant,
+    mock_coordinator: MagicMock,
+    raw_value: str | None,
+    expected: bool | None,
+) -> None:
+    """SYSTEM.UPDATE maps valid flags and rejects malformed values."""
+    system = PoolObject(
+        "SYS01",
+        {"OBJTYP": SYSTEM_TYPE, "SNAME": "System", "UPDATE": raw_value},
+    )
+
+    sensors = _build_entities(mock_coordinator, [system])
+    update_sensors = [
+        item for item in sensors if isinstance(item, FirmwareUpdateBinarySensor)
+    ]
+
+    assert len(update_sensors) == 1
+    sensor = update_sensors[0]
+    assert sensor.name == "Firmware Update Available"
+    assert sensor.device_class == BinarySensorDeviceClass.UPDATE
+    assert sensor.entity_category == EntityCategory.DIAGNOSTIC
+    assert sensor.entity_registry_enabled_default is True
+    assert sensor.is_on is expected
+    assert sensor.isUpdated({"SYS01": {UPDATE_ATTR: STATUS_ON}}) is True
 
 
 @pytest.fixture
@@ -81,6 +151,14 @@ def pool_object_schedule() -> PoolObject:
             "SNAME": "Morning Filter",
             "ACT": "ON",
             "VACFLO": "OFF",
+            "CIRCUIT": "CIRC01",
+            "DAY": "MTWRF",
+            "TIME": "08:00",
+            "TIMOUT": "10:00",
+            "HEATER": "HTR01",
+            "LOTMP": "82",
+            "SINGLE": "OFF",
+            "DNTSTP": "ON",
         },
     )
 
@@ -113,6 +191,148 @@ async def test_binary_sensor_setup_creates_entities(
     # - Pump (PUMP1)
     # - Schedule (SCHED1)
     assert len(entities_added) >= 3
+
+
+async def test_chemistry_binary_sensors_created_only_for_intellichem(
+    hass: HomeAssistant,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Only IntelliChem creates the aggregate chemistry alert sensor."""
+    intellichem = PoolObject(
+        "CHEM1",
+        {"OBJTYP": CHEM_TYPE, "SUBTYP": "ICHEM", "SNAME": "IntelliChem"},
+    )
+    intellichlor = PoolObject(
+        "CHEM2",
+        {"OBJTYP": CHEM_TYPE, "SUBTYP": "ICHLOR", "SNAME": "IntelliChlor"},
+    )
+
+    sensors = _build_entities(mock_coordinator, [intellichem, intellichlor])
+
+    assert (
+        len([sensor for sensor in sensors if isinstance(sensor, ChemAlertBinarySensor)])
+        == 1
+    )
+    chemistry_alert = next(
+        sensor for sensor in sensors if isinstance(sensor, ChemAlertBinarySensor)
+    )
+    assert chemistry_alert.unique_id == "test_entry_CHEM1CHEM_ALERT"
+    assert chemistry_alert.entity_registry_enabled_default is True
+    assert all(sensor._pool_object.objnam != "CHEM2" for sensor in sensors)
+
+
+async def test_legacy_alarm_sensors_remain_on_intellichem_subtype(
+    hass: HomeAssistant,
+    mock_coordinator: MagicMock,
+) -> None:
+    """All four existing per-alarm sensors remain attached only to IntelliChem."""
+    alarm_values = {
+        PHHI_ATTR: "OFF",
+        PHLO_ATTR: "OFF",
+        ORPHI_ATTR: "OFF",
+        ORPLO_ATTR: "OFF",
+    }
+    intellichem = PoolObject(
+        "CHEM1",
+        {
+            "OBJTYP": CHEM_TYPE,
+            "SUBTYP": "ICHEM",
+            "SNAME": "IntelliChem",
+            **alarm_values,
+        },
+    )
+    intellichlor = PoolObject(
+        "CHEM2",
+        {
+            "OBJTYP": CHEM_TYPE,
+            "SUBTYP": "ICHLOR",
+            "SNAME": "IntelliChlor",
+            **alarm_values,
+        },
+    )
+
+    chem_sensors = _build_entities(mock_coordinator, [intellichem])
+    chlor_sensors = _build_entities(mock_coordinator, [intellichlor])
+
+    individual_chem_alarms = {
+        sensor._attribute_key
+        for sensor in chem_sensors
+        if type(sensor) is PoolBinarySensor
+    }
+    individual_chlor_alarms = {
+        sensor._attribute_key
+        for sensor in chlor_sensors
+        if type(sensor) is PoolBinarySensor
+    }
+    assert individual_chem_alarms == {
+        PHHI_ATTR,
+        PHLO_ATTR,
+        ORPHI_ATTR,
+        ORPLO_ATTR,
+    }
+    assert individual_chlor_alarms == set()
+
+
+@pytest.mark.parametrize(
+    ("values", "helper_result", "expected"),
+    [
+        (
+            {PHHI_ATTR: "OFF", PHLO_ATTR: "OFF", ORPHI_ATTR: "OFF", ORPLO_ATTR: "OFF"},
+            False,
+            False,
+        ),
+        (
+            {PHHI_ATTR: "ON", PHLO_ATTR: "OFF", ORPHI_ATTR: "OFF", ORPLO_ATTR: "OFF"},
+            True,
+            True,
+        ),
+        (
+            {PHHI_ATTR: None, PHLO_ATTR: "ON", ORPHI_ATTR: "OFF", ORPLO_ATTR: "OFF"},
+            True,
+            True,
+        ),
+        (
+            {PHHI_ATTR: None, PHLO_ATTR: "OFF", ORPHI_ATTR: "OFF", ORPLO_ATTR: "OFF"},
+            False,
+            None,
+        ),
+        (
+            {PHHI_ATTR: None, PHLO_ATTR: "OFF", ORPHI_ATTR: "OFF", ORPLO_ATTR: "OFF"},
+            True,
+            None,
+        ),
+        (
+            {PHHI_ATTR: "BAD", PHLO_ATTR: "OFF", ORPHI_ATTR: "OFF", ORPLO_ATTR: "OFF"},
+            False,
+            None,
+        ),
+    ],
+)
+async def test_chem_alert_state_mapping(
+    hass: HomeAssistant,
+    mock_coordinator: MagicMock,
+    values: dict[str, str | None],
+    helper_result: bool,
+    expected: bool | None,
+) -> None:
+    """A known active alert wins even when another input is unknown."""
+    chem = PoolObject(
+        "CHEM1",
+        {"OBJTYP": CHEM_TYPE, "SUBTYP": "ICHEM", "SNAME": "IntelliChem", **values},
+    )
+    mock_coordinator.controller.has_chem_alert.return_value = helper_result
+    mock_coordinator.controller.get_chem_alerts.return_value = (
+        ["pH High"] if helper_result else []
+    )
+    sensor = ChemAlertBinarySensor(mock_coordinator, chem)
+
+    assert sensor.is_on is expected
+    if expected is not None:
+        assert sensor.extra_state_attributes["active_alerts"] == (
+            ["pH High"] if helper_result else []
+        )
+    else:
+        assert "active_alerts" not in sensor.extra_state_attributes
 
 
 async def test_freeze_protection_sensor_off(
@@ -227,6 +447,100 @@ async def test_schedule_sensor_inactive(
     )
 
     assert sensor.is_on is False
+
+
+@pytest.mark.parametrize(("raw_value", "expected"), ON_OFF_UNKNOWN_CASES)
+async def test_schedule_binary_sensor_state_mapping(
+    mock_coordinator: MagicMock,
+    raw_value: str | None,
+    expected: bool | None,
+) -> None:
+    """Schedule runtime state maps only canonical protocol ON/OFF values."""
+    schedule = PoolObject(
+        "SCHED1",
+        {"OBJTYP": SCHED_TYPE, "SNAME": "Schedule", "ACT": raw_value},
+    )
+
+    assert ScheduleBinarySensor(mock_coordinator, schedule).is_on is expected
+
+
+async def test_schedule_sensor_details_and_disabled_default(
+    hass: HomeAssistant,
+    pool_object_schedule: PoolObject,
+    pool_object_switch: PoolObject,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Schedule running sensor exposes complete details and circuit name."""
+    mock_coordinator.model.__getitem__ = MagicMock(
+        side_effect=lambda objnam: (
+            pool_object_switch if objnam == "CIRC01" else pool_object_schedule
+        )
+    )
+    mock_coordinator.controller.get_schedule_circuit.return_value = "CIRC01"
+    mock_coordinator.controller.get_schedule_days.return_value = "MTWRF"
+    mock_coordinator.controller.get_schedule_start_time.return_value = "08:00"
+    mock_coordinator.controller.get_schedule_stop_time.return_value = "10:00"
+
+    sensor = ScheduleBinarySensor(mock_coordinator, pool_object_schedule)
+    attrs = sensor.extra_state_attributes
+
+    assert sensor.entity_registry_enabled_default is False
+    assert attrs["CIRCUIT"] == "CIRC01"
+    assert attrs["CIRCUIT_NAME"] == "Pool Cleaner"
+    assert attrs["DAY"] == "MTWRF"
+    assert attrs["TIME"] == "08:00"
+    assert attrs["TIMOUT"] == "10:00"
+    assert attrs["HEATER"] == "HTR01"
+    assert attrs["LOTMP"] == "82"
+    assert attrs["SINGLE"] == "OFF"
+    assert attrs["DNTSTP"] == "ON"
+    assert attrs["VACFLO"] == "OFF"
+
+    for attribute in (
+        "ACT",
+        "CIRCUIT",
+        "DAY",
+        "TIME",
+        "TIMOUT",
+        "HEATER",
+        "LOTMP",
+        "SINGLE",
+        "DNTSTP",
+        "STATUS",
+        "VACFLO",
+    ):
+        assert sensor.isUpdated({"SCHED1": {attribute: "changed"}}) is True
+
+
+async def test_schedule_sensor_omits_missing_details(
+    hass: HomeAssistant,
+    mock_coordinator: MagicMock,
+) -> None:
+    """Missing schedule detail fields are absent from state attributes."""
+    schedule = PoolObject(
+        "SCHED2",
+        {"OBJTYP": SCHED_TYPE, "SNAME": "Incomplete", "ACT": "OFF"},
+    )
+    mock_coordinator.controller.get_schedule_circuit.return_value = None
+    mock_coordinator.controller.get_schedule_days.return_value = None
+    mock_coordinator.controller.get_schedule_start_time.return_value = None
+    mock_coordinator.controller.get_schedule_stop_time.return_value = None
+
+    attrs = ScheduleBinarySensor(mock_coordinator, schedule).extra_state_attributes
+
+    for key in (
+        "CIRCUIT",
+        "CIRCUIT_NAME",
+        "DAY",
+        "TIME",
+        "TIMOUT",
+        "HEATER",
+        "LOTMP",
+        "SINGLE",
+        "DNTSTP",
+        "VACFLO",
+    ):
+        assert key not in attrs
 
 
 async def test_heater_sensor_heating(
