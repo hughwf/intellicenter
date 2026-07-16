@@ -46,6 +46,8 @@ CONTROLLER_METHODS = (
     "body_supports_cooling",
     "get_chem_alerts",
     "get_chlorinator_output",
+    "get_circuit_group_members",
+    "get_circuits_in_group",
     "get_pump_circuit_speed",
     "get_saturation_index",
     "get_schedule_circuit",
@@ -61,6 +63,7 @@ CONTROLLER_METHODS = (
     "is_vacation_mode",
     "refresh_pump_circuit_speed",
     "request_changes",
+    "run_light_group_sync",
     "set_alkalinity",
     "set_calcium_hardness",
     "set_chlorinator_output",
@@ -83,6 +86,7 @@ REQUIRED_SYMBOLS = (
     "ICModelController",
     "ICConnectionHandler",
     "ICConnectionError",
+    "ICLightGroupError",
     "ICTimeoutError",
     "ICSystemInfo",
     "PoolModel",
@@ -116,6 +120,34 @@ def test_controller_methods_exist_and_callable() -> None:
     )
 
 
+def test_light_group_error_contract_is_available() -> None:
+    """The installed library exposes certainty metadata consumed by the service."""
+    error_type = pyintellicenter.ICLightGroupError
+    assert callable(pyintellicenter.ICModelController.run_light_group_sync)
+    assert issubclass(error_type, pyintellicenter.ICError)
+
+    error = error_type(
+        "failed",
+        phase="terminal",
+        response_received=True,
+        acknowledged=True,
+        onset_seen=True,
+    )
+    assert error.phase == "terminal"
+    assert error.dispatch_started is True
+    assert error.response_received is True
+    assert error.acknowledged is True
+    assert error.onset_seen is True
+
+
+def test_only_scoped_light_group_writer_exists() -> None:
+    """The installed controller does not expose speculative group writers."""
+    controller = pyintellicenter.ICModelController
+    assert not hasattr(controller, "run_light_group_command")
+    assert not hasattr(controller, "run_light_group_swim")
+    assert not hasattr(controller, "set_light_group_member_position")
+
+
 def test_light_effects_includes_sam_show() -> None:
     """The installed library must map the SAm light show (issue #47).
 
@@ -140,6 +172,15 @@ def test_chemistry_and_manual_heat_attributes_are_tracked() -> None:
     assert "CHLOR" not in DEFAULT_ATTRIBUTES_MAP[pyintellicenter.CHEM_TYPE]
     assert MANHT_ATTR not in DEFAULT_ATTRIBUTES_MAP[pyintellicenter.BODY_TYPE]
     assert MANHT_ATTR in DEFAULT_ATTRIBUTES_MAP[pyintellicenter.SYSTEM_TYPE]
+
+
+def test_circuit_group_membership_rows_track_only_relationship_fields() -> None:
+    """Circuit-group rows retain only their real relationship attributes."""
+    assert DEFAULT_ATTRIBUTES_MAP[pyintellicenter.CIRCGRP_TYPE] == {
+        pyintellicenter.PARENT_ATTR,
+        pyintellicenter.CIRCUIT_ATTR,
+        pyintellicenter.LISTORD_ATTR,
+    }
 
 
 def test_roadmap_attributes_are_tracked() -> None:

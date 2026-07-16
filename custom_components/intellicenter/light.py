@@ -12,16 +12,19 @@ from typing import Any
 
 from homeassistant.components.light import ATTR_BRIGHTNESS, ATTR_EFFECT, LightEntity
 from homeassistant.components.light.const import ColorMode, LightEntityFeature
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_platform
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from pyintellicenter import (
     ACT_ATTR,
     CIRCUIT_ATTR,
+    CIRCUIT_TYPE,
     LIGHT_EFFECTS,
     STATUS_ATTR,
     USE_ATTR,
+    ICError,
+    ICLightGroupError,
     PoolObject,
 )
 
@@ -41,20 +44,88 @@ PARALLEL_UPDATES = 0
 
 _DIMMABLE_SUBTYPES = frozenset({"DIMMER"})
 _SUPPORTED_DIMMER_LEVELS = (50, 75, 100)
-_MAGICSTREAM_SERVICES = {
+_ENTITY_SERVICES = {
     "capture": "async_capture",
     "thumper": "async_thumper",
     "hold": "async_hold",
     "recall": "async_recall",
+    "color_sync": "async_color_sync",
 }
+
+
+def _complete_light_group_children(
+    coordinator: IntelliCenterCoordinator, parent: PoolObject
+) -> tuple[PoolObject, ...] | None:
+    """Resolve every distinct child of a real light-group parent."""
+    if parent.objtype != CIRCUIT_TYPE or parent.subtype != "LITSHO":
+        return None
+    members = coordinator.controller.get_circuit_group_members(parent.objnam)
+    children = coordinator.controller.get_circuits_in_group(parent.objnam)
+    if (
+        not members
+        or len(children) != len(members)
+        or len({child.objnam for child in children}) != len(children)
+    ):
+        return None
+    return tuple(children)
+
+
+def _is_complete_color_light_group(
+    coordinator: IntelliCenterCoordinator, parent: PoolObject
+) -> bool:
+    """Return whether a complete light group supports existing color effects."""
+    children = _complete_light_group_children(coordinator, parent)
+    return children is not None and all(
+        child.supports_color_effects for child in children
+    )
+
+
+def _is_color_sync_eligible(
+    coordinator: IntelliCenterCoordinator, parent: PoolObject
+) -> bool:
+    """Return whether the group matches the evidence-scoped Color Sync gate."""
+    children = _complete_light_group_children(coordinator, parent)
+    system_info = coordinator.system_info
+    return bool(
+        system_info is not None
+        and system_info.sw_version == "1.064"
+        and children is not None
+        and len(children) == 2
+        and all(
+            child.objtype == CIRCUIT_TYPE and child.subtype == "GLOW"
+            for child in children
+        )
+    )
 
 
 def _build_entities(
     coordinator: IntelliCenterCoordinator, candidates: Iterable[PoolObject]
 ) -> list[PoolLight]:
     """Build light entities for the given candidate pool objects."""
+    candidate_list = list(candidates)
+    candidate_objnams = {obj.objnam for obj in candidate_list}
+    entity_objects = {
+        obj.objnam: obj
+        for obj in candidate_list
+        if obj.is_a_light or obj.is_a_light_show
+    }
+
+    # Re-evaluate an existing parent when a membership row or referenced child
+    # arrives later. The shared setup helper de-duplicates the replacement by
+    # unique_id and asks the original entity to refresh its model context.
+    for parent in coordinator.model:
+        if not parent.is_a_light_show:
+            continue
+        members = coordinator.controller.get_circuit_group_members(parent.objnam)
+        if parent.objnam in candidate_objnams or any(
+            member.objnam in candidate_objnams
+            or member[CIRCUIT_ATTR] in candidate_objnams
+            for member in members
+        ):
+            entity_objects.setdefault(parent.objnam, parent)
+
     lights: list[PoolLight] = []
-    for obj in candidates:
+    for obj in entity_objects.values():
         if obj.is_a_light:
             lights.append(
                 PoolLight(
@@ -64,18 +135,13 @@ def _build_entities(
                 )
             )
         elif obj.is_a_light_show:
-            # Check if all child lights support color effects
-            children = coordinator.model.get_children(obj)
-            supports_color = all(
-                circuit_obj.supports_color_effects
-                for child in children
-                if (circuit_obj := coordinator.model[child[CIRCUIT_ATTR]]) is not None
-            )
             lights.append(
                 PoolLight(
                     coordinator,
                     obj,
-                    LIGHT_EFFECTS if supports_color else None,
+                    LIGHT_EFFECTS
+                    if _is_complete_color_light_group(coordinator, obj)
+                    else None,
                 )
             )
     return lights
@@ -88,7 +154,7 @@ async def async_setup_entry(
 ) -> None:
     """Load pool lights based on a config entry."""
     platform = entity_platform.async_get_current_platform()
-    for service_name, method_name in _MAGICSTREAM_SERVICES.items():
+    for service_name, method_name in _ENTITY_SERVICES.items():
         platform.async_register_entity_service(service_name, None, method_name)
     async_setup_pool_entities(entry, async_add_entities, _build_entities)
 
@@ -120,18 +186,52 @@ class PoolLight(PoolEntity, OnOffControlMixin, LightEntity):
         """
         super().__init__(coordinator, pool_object, extra_state_attributes=[USE_ATTR])
 
-        self._light_effects = color_effects
+        self._attr_supported_features = LightEntityFeature(0)
+        self._light_effects: dict[str, str] | None = None
+        self._reversed_light_effects: dict[str, str] | None = None
         self._dimmable = pool_object.subtype in _DIMMABLE_SUBTYPES
-        self._reversed_light_effects: dict[str, str] | None = (
-            {v: k for k, v in color_effects.items()} if color_effects else None
-        )
 
         if self._dimmable:
             self._attr_color_mode = ColorMode.BRIGHTNESS
             self._attr_supported_color_modes = {ColorMode.BRIGHTNESS}
 
-        if self._light_effects:
+        self._set_light_effects(color_effects)
+
+    def _set_light_effects(self, color_effects: dict[str, str] | None) -> bool:
+        """Replace the effect mapping and report whether capability changed."""
+        if self._light_effects == color_effects:
+            return False
+        self._light_effects = color_effects
+        self._reversed_light_effects = (
+            {value: key for key, value in color_effects.items()}
+            if color_effects
+            else None
+        )
+        if color_effects:
             self._attr_supported_features |= LightEntityFeature.EFFECT
+        else:
+            self._attr_supported_features &= ~LightEntityFeature.EFFECT
+        return True
+
+    def _refresh_light_group_effects(self) -> bool:
+        """Refresh group effects from the current complete membership model."""
+        if not self._pool_object.is_a_light_show:
+            return False
+        color_effects = (
+            LIGHT_EFFECTS
+            if _is_complete_color_light_group(self.coordinator, self._pool_object)
+            else None
+        )
+        return self._set_light_effects(color_effects)
+
+    @callback
+    def async_refresh_model_context(self) -> None:
+        """Refresh cross-object group capability without replacing the entity."""
+        current = self.coordinator.model[self._pool_object.objnam]
+        if current is not None:
+            self._pool_object = current
+        if self._refresh_light_group_effects() and self.hass is not None:
+            self.async_write_ha_state()
 
     @property
     def brightness(self) -> int | None:
@@ -247,8 +347,49 @@ class PoolLight(PoolEntity, OnOffControlMixin, LightEntity):
         """Recall the saved MagicStream color."""
         await self._async_magicstream_command("RECALL")
 
+    async def async_color_sync(self) -> None:
+        """Synchronize the supported two-light IntelliCenter group."""
+        if not _is_color_sync_eligible(self.coordinator, self._pool_object):
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="light_group_command_unsupported",
+            )
+        try:
+            await self._controller.run_light_group_sync(self._pool_object.objnam)
+        except ValueError as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="light_group_command_unsupported",
+            ) from err
+        except ICLightGroupError as err:
+            if err.acknowledged or err.onset_seen:
+                translation_key = "light_group_command_incomplete"
+            elif err.dispatch_started and not err.response_received:
+                translation_key = "light_group_command_uncertain"
+            else:
+                translation_key = "light_group_command_failed"
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key=translation_key,
+            ) from err
+        except ICError as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="light_group_command_failed",
+            ) from err
+
     def isUpdated(self, updates: dict[str, dict[str, Any]]) -> bool:
         """Return true if the entity is updated by the updates from IntelliCenter."""
-        return self._check_attributes_updated(
-            updates, STATUS_ATTR, USE_ATTR, LIMIT_ATTR
+        return self._refresh_light_group_effects() or self._check_attributes_updated(
+            updates,
+            STATUS_ATTR,
+            USE_ATTR,
+            LIMIT_ATTR,
         )
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Refresh group capability across reconnects and ordinary updates."""
+        if not (self.coordinator.data or {}):
+            self._refresh_light_group_effects()
+        super()._handle_coordinator_update()
