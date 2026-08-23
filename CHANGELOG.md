@@ -10,9 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Color Sync light-group action** (#93) - Added the blocking `intellicenter.color_sync` service for complete light groups with exactly two distinct GloBrite members on firmware 1.064, available over TCP and WebSocket.
+- **Ghost-equipment entity removal** (#113) - Equipment deleted at the panel is now removed from Home Assistant at runtime. pyintellicenter 0.2.0 reconciles the pool model against the authoritative snapshot on every connect and reconnect and reports pruned objects as removal entries; the integration removes the corresponding entities from the entity registry, so they no longer linger as unavailable ghosts until a restart. Equipment that is later re-added is detected as new and gets fresh entities. Known limitation: entities that merely *depend* on removed equipment (e.g. a body's water heater entity after its last heater is deleted) are not retired automatically - reload the integration after deleting such equipment.
 
 ### Changed
 
+- **Requires pyintellicenter >= 0.2.0** (#113) - Adopts the 0.2.0 connection-handler API: `async_unload_entry` and Home Assistant shutdown now await the full controller teardown (`astop()`), so an unload or reload can never race a half-closed connection, and model updates flow through the new `subscribe()` API (the handler subclass keeps lifecycle events only). Entity availability deliberately stays on the coordinator's callback-driven flag rather than the handler's `connected` property, whose flag flips True only after `on_reconnected` has run (adopting it would have rendered every entity unavailable on each reconnect - caught in adversarial review). Also picks up the library's notification burst batching, per-frame overflow coalescing, discovery rewrite, and hot-path performance fixes.
 - **Requires pyintellicenter >= 0.1.22** (#93) - The Color Sync action uses the protocol library's blocking authoritative lifecycle: it observes the physical action, continues through a 60-second post-terminal window, and performs a final controller read while isolating other mutations on the Home Assistant connection.
 
 ### Fixed
